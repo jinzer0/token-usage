@@ -20,11 +20,37 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
-    pub fn warning(client: Client, code: impl Into<String>, message: impl Into<String>, path: Option<PathBuf>, line: Option<u64>) -> Self {
-        Self { client, severity: Severity::Warning, code: code.into(), message: message.into(), path, line }
+    pub fn warning(
+        client: Client,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        path: Option<PathBuf>,
+        line: Option<u64>,
+    ) -> Self {
+        Self {
+            client,
+            severity: Severity::Warning,
+            code: code.into(),
+            message: message.into(),
+            path,
+            line,
+        }
     }
 
-    pub fn error(client: Client, code: impl Into<String>, message: impl Into<String>, path: Option<PathBuf>, line: Option<u64>) -> Self {
-        Self { client, severity: Severity::Error, code: code.into(), message: message.into(), path, line }
+    pub fn error(
+        client: Client,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        path: Option<PathBuf>,
+        line: Option<u64>,
+    ) -> Self {
+        Self {
+            client,
+            severity: Severity::Error,
+            code: code.into(),
+            message: message.into(),
+            path,
+            line,
+        }
     }
 }

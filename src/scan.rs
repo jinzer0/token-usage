@@ -1,4 +1,7 @@
-use crate::{diagnostics::{Diagnostic, Severity}, domain::{Client, UsageRecord}};
+use crate::{
+    diagnostics::{Diagnostic, Severity},
+    domain::{Client, UsageRecord},
+};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -57,8 +60,19 @@ pub struct ParseResult {
 
 impl ParseResult {
     pub fn empty(client: Client, root: PathBuf) -> Self {
-        let mut summary = ScanSummary { client: Some(client), ..Default::default() };
-        if root.exists() { summary.roots_scanned.push(root); } else { summary.missing_roots.push(root); }
-        Self { records: Vec::new(), diagnostics: Vec::new(), summary }
+        let mut summary = ScanSummary {
+            client: Some(client),
+            ..Default::default()
+        };
+        if root.exists() {
+            summary.roots_scanned.push(root);
+        } else {
+            summary.missing_roots.push(root);
+        }
+        Self {
+            records: Vec::new(),
+            diagnostics: Vec::new(),
+            summary,
+        }
     }
 }

@@ -1,10 +1,17 @@
-use crate::{aggregate::{aggregate, resolve_session, AggregateSnapshot}, domain::Client, format, sources};
-use anyhow::{bail, Result};
+use crate::{
+    aggregate::{AggregateSnapshot, aggregate, resolve_session},
+    domain::Client,
+    format, sources,
+};
+use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
-#[command(name = "token-usage", about = "Summarize local Codex and GJC token usage")]
+#[command(
+    name = "token-usage",
+    about = "Summarize local Codex and GJC token usage"
+)]
 pub struct Cli {
     pub session: Option<String>,
     #[arg(long)]
@@ -22,13 +29,21 @@ pub struct Cli {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
-pub enum ClientFilter { All, Codex, Gjc }
+pub enum ClientFilter {
+    All,
+    Codex,
+    Gjc,
+}
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    if cli.json && cli.tui { bail!("--json and --tui cannot be used together"); }
+    if cli.json && cli.tui {
+        bail!("--json and --tui cannot be used together");
+    }
     let snapshot = build_snapshot(&cli)?;
-    if cli.tui { return crate::ui::run(snapshot, || build_snapshot(&cli)); }
+    if cli.tui {
+        return crate::ui::run(snapshot, || build_snapshot(&cli));
+    }
     if cli.json {
         println!("{}", format::json::render(&snapshot)?);
         return Ok(());
@@ -45,11 +60,18 @@ pub fn run() -> Result<()> {
 pub fn build_snapshot(cli: &Cli) -> Result<AggregateSnapshot> {
     let mut results = Vec::new();
     if matches!(cli.client, ClientFilter::All | ClientFilter::Codex) {
-        let root = cli.codex_home.clone().unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".codex"));
+        let root = cli
+            .codex_home
+            .clone()
+            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".codex"));
         results.push(sources::codex::parse(&root)?);
     }
     if matches!(cli.client, ClientFilter::All | ClientFilter::Gjc) {
-        let root = cli.gjc_home.clone().unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".gjc/agent/sessions"));
+        let root = cli.gjc_home.clone().unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join(".gjc/agent/sessions")
+        });
         results.push(sources::gjc::parse(&root)?);
     }
     Ok(aggregate(results))
@@ -57,6 +79,10 @@ pub fn build_snapshot(cli: &Cli) -> Result<AggregateSnapshot> {
 
 impl From<ClientFilter> for Option<Client> {
     fn from(value: ClientFilter) -> Self {
-        match value { ClientFilter::All => None, ClientFilter::Codex => Some(Client::Codex), ClientFilter::Gjc => Some(Client::Gjc) }
+        match value {
+            ClientFilter::All => None,
+            ClientFilter::Codex => Some(Client::Codex),
+            ClientFilter::Gjc => Some(Client::Gjc),
+        }
     }
 }
