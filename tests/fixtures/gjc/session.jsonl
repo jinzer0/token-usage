@@ -1,0 +1,4 @@
+{"type":"header","session_id":"same","title":"GJC Fixture","parent_session_id":"parent"}
+{"type":"thinking_level_change","branch":"main","effort":"medium"}
+{"type":"message","message":{"id":"g1","role":"assistant","model":"claude","usage":{"input":50,"output":25,"reasoningTokens":5,"totalTokens":75},"timestamp":"2026-09-11T00:00:00Z"}}
+{"type":"message","message":{"id":"g1","role":"assistant","model":"claude","usage":{"input":50,"output":25,"reasoningTokens":5,"totalTokens":75}}}
