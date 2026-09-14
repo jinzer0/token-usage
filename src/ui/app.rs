@@ -265,6 +265,8 @@ mod tests {
                     record_count: 0,
                 })
                 .collect(),
+            timeline: vec![],
+            periods: Default::default(),
             diagnostics: vec![],
             source_counts: Default::default(),
         }

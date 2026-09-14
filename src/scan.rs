@@ -15,6 +15,8 @@ pub struct ScanSummary {
     pub lines_read: u64,
     pub records_emitted: u64,
     pub records_skipped: u64,
+    pub records_time_filtered: u64,
+    pub records_missing_timestamp_filtered: u64,
 }
 
 #[derive(Default, Clone, Debug, Serialize)]
@@ -26,6 +28,8 @@ pub struct SourceCounts {
     pub lines_read: u64,
     pub records_emitted: u64,
     pub records_skipped: u64,
+    pub records_time_filtered: u64,
+    pub records_missing_timestamp_filtered: u64,
     pub warnings: u64,
     pub errors: u64,
 }
@@ -39,6 +43,8 @@ impl SourceCounts {
         self.lines_read += summary.lines_read;
         self.records_emitted += summary.records_emitted;
         self.records_skipped += summary.records_skipped;
+        self.records_time_filtered += summary.records_time_filtered;
+        self.records_missing_timestamp_filtered += summary.records_missing_timestamp_filtered;
     }
 
     pub fn merge_diagnostics(&mut self, diagnostics: &[Diagnostic]) {

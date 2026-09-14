@@ -198,6 +198,22 @@ fn parse_file(
         if tokens.input_uncached == 0 {
             tokens.input_uncached = tokens.input_total.saturating_sub(tokens.cache_read);
         }
+        let timestamp = match string_at(&v, &["timestamp", "created_at", "createdAt"]) {
+            Some(raw) => match DateTime::parse_from_rfc3339(&raw) {
+                Ok(dt) => Some(dt.with_timezone(&Utc)),
+                Err(e) => {
+                    diagnostics.push(Diagnostic::warning(
+                        Client::Codex,
+                        "CodexInvalidTimestamp",
+                        e.to_string(),
+                        Some(path.to_path_buf()),
+                        Some(line_no),
+                    ));
+                    None
+                }
+            },
+            None => None,
+        };
         records.push(UsageRecord {
             session_key: SessionKey {
                 client: Client::Codex,
@@ -207,9 +223,7 @@ fn parse_file(
             message_id: string_at(&v, &["id", "message_id", "messageId"]).map(MessageId),
             source_path: path.to_path_buf(),
             source_line: Some(line_no),
-            started_at: string_at(&v, &["timestamp", "created_at", "createdAt"])
-                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                .map(|dt| dt.with_timezone(&Utc)),
+            started_at: timestamp,
             session_name: names.get(&session_id).cloned(),
             model,
             reasoning_effort: effort.clone(),

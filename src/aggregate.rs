@@ -2,8 +2,10 @@ use crate::{
     diagnostics::Diagnostic,
     domain::{ReasoningEffort, SessionKey, TokenStats, UsageRecord},
     scan::{ParseResult, SourceCounts},
+    time::{GroupBy, TimeMatch, TimeSelection, bucket_start},
 };
-use chrono::{DateTime, Utc};
+use anyhow::Result;
+use chrono::{DateTime, Duration, Local, Utc};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -37,8 +39,30 @@ pub struct SessionStats {
 pub struct AggregateSnapshot {
     pub generated_at: DateTime<Utc>,
     pub sessions: Vec<SessionStats>,
+    pub timeline: Vec<TimeBucket>,
+    pub periods: PeriodUsage,
     pub diagnostics: Vec<Diagnostic>,
     pub source_counts: SourceCounts,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TimeBucket {
+    pub start: DateTime<Utc>,
+    pub tokens: TokenStats,
+    pub record_count: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct PeriodUsage {
+    pub today: TokenStats,
+    pub seven_days: TokenStats,
+    pub thirty_days: TokenStats,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AggregateOptions {
+    pub time_selection: TimeSelection,
+    pub group_by: Option<GroupBy>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -53,15 +77,65 @@ pub enum SelectorError {
 }
 
 pub fn aggregate(results: Vec<ParseResult>) -> AggregateSnapshot {
+    aggregate_with_options(results, &AggregateOptions::default())
+        .expect("default aggregation cannot fail")
+}
+
+pub fn aggregate_with_options(
+    results: Vec<ParseResult>,
+    options: &AggregateOptions,
+) -> Result<AggregateSnapshot> {
     let mut source_counts = SourceCounts::default();
     let mut diagnostics = Vec::new();
     let mut by_session: BTreeMap<SessionKey, Vec<UsageRecord>> = BTreeMap::new();
+    let mut timeline: BTreeMap<DateTime<Utc>, TimeBucket> = BTreeMap::new();
+    let mut periods = PeriodUsage::default();
+    let now = Local::now();
+    let today_start = crate::time::build_selection(true, None, None, now)?.since;
+    let seven_days_start = (now - Duration::days(7)).with_timezone(&Utc);
+    let thirty_days_start = (now - Duration::days(30)).with_timezone(&Utc);
 
     for result in results {
         source_counts.merge_summary(&result.summary);
         source_counts.merge_diagnostics(&result.diagnostics);
         diagnostics.extend(result.diagnostics);
         for record in result.records {
+            match options.time_selection.contains(record.started_at) {
+                TimeMatch::Included => {}
+                TimeMatch::MissingTimestamp => {
+                    source_counts.records_missing_timestamp_filtered += 1;
+                    continue;
+                }
+                TimeMatch::OutsideRange => {
+                    source_counts.records_time_filtered += 1;
+                    continue;
+                }
+            }
+            if let Some(group_by) = options.group_by
+                && let Some(started_at) = record.started_at
+            {
+                let start = bucket_start(started_at, group_by)?;
+                let bucket = timeline.entry(start).or_insert_with(|| TimeBucket {
+                    start,
+                    tokens: TokenStats::default(),
+                    record_count: 0,
+                });
+                bucket.tokens.add_assign(&record.tokens);
+                bucket.record_count += 1;
+            } else if options.group_by.is_some() {
+                source_counts.records_missing_timestamp_filtered += 1;
+            }
+            if let Some(started_at) = record.started_at {
+                if today_start.is_some_and(|start| started_at >= start) {
+                    periods.today.add_assign(&record.tokens);
+                }
+                if started_at >= seven_days_start {
+                    periods.seven_days.add_assign(&record.tokens);
+                }
+                if started_at >= thirty_days_start {
+                    periods.thirty_days.add_assign(&record.tokens);
+                }
+            }
             by_session
                 .entry(record.session_key.clone())
                 .or_default()
@@ -80,12 +154,14 @@ pub fn aggregate(results: Vec<ParseResult>) -> AggregateSnapshot {
             .then_with(|| a.key.qualified().cmp(&b.key.qualified()))
     });
 
-    AggregateSnapshot {
+    Ok(AggregateSnapshot {
         generated_at: Utc::now(),
         sessions,
+        timeline: timeline.into_values().collect(),
+        periods,
         diagnostics,
         source_counts,
-    }
+    })
 }
 
 fn build_session(key: SessionKey, records: Vec<UsageRecord>) -> SessionStats {

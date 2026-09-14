@@ -83,6 +83,8 @@ mod tests {
                 }],
                 record_count: 1,
             }],
+            timeline: vec![],
+            periods: Default::default(),
             diagnostics: vec![],
             source_counts: Default::default(),
         }
@@ -114,6 +116,8 @@ mod tests {
         let mut app = App::new(AggregateSnapshot {
             generated_at: Utc::now(),
             sessions: vec![],
+            timeline: vec![],
+            periods: Default::default(),
             diagnostics: vec![],
             source_counts: Default::default(),
         });

@@ -5,4 +5,5 @@ pub mod domain;
 pub mod format;
 pub mod scan;
 pub mod sources;
+pub mod time;
 pub mod ui;

@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package Unix
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="token-usage-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "$name"
+          cp "target/${{ matrix.target }}/release/token-usage" "$name/token-usage"
+          cp README.md "$name/README.md"
+          if [ -f LICENSE ]; then cp LICENSE "$name/LICENSE"; fi
+          tar -czf "$name.tar.gz" -C "$name" .
+          shasum -a 256 "$name.tar.gz" | sed "s#  #  #" > "$name.sha256"
+      - name: Package Windows
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $name = "token-usage-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/token-usage.exe" "$name/token-usage.exe"
+          Copy-Item README.md "$name/README.md"
+          if (Test-Path LICENSE) { Copy-Item LICENSE "$name/LICENSE" }
+          Compress-Archive -Path "$name/*" -DestinationPath "$name.zip"
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii "$name.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: token-usage-${{ matrix.target }}
+          path: |
+            token-usage-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+            token-usage-${{ github.ref_name }}-${{ matrix.target }}.zip
+            token-usage-${{ github.ref_name }}-${{ matrix.target }}.sha256
+          if-no-files-found: ignore
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          find dist -name '*.sha256' -exec cat {} \; > dist/SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS

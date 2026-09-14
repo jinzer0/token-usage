@@ -193,6 +193,24 @@ fn parse_file(
         }
         let branch = string_at(message, &["branch", "branch_id", "branchId"])
             .or_else(|| string_at(&v, &["branch", "branch_id", "branchId"]));
+        let timestamp_raw = string_at(message, &["timestamp", "created_at", "createdAt"])
+            .or_else(|| string_at(&v, &["timestamp", "created_at", "createdAt"]));
+        let timestamp = match timestamp_raw {
+            Some(raw) => match DateTime::parse_from_rfc3339(&raw) {
+                Ok(dt) => Some(dt.with_timezone(&Utc)),
+                Err(e) => {
+                    diagnostics.push(Diagnostic::warning(
+                        Client::Gjc,
+                        "GjcInvalidTimestamp",
+                        e.to_string(),
+                        Some(path.to_path_buf()),
+                        Some(line_no),
+                    ));
+                    None
+                }
+            },
+            None => None,
+        };
         records.push(UsageRecord {
             session_key: SessionKey {
                 client: Client::Gjc,
@@ -205,10 +223,7 @@ fn parse_file(
             message_id: msg_id.map(MessageId),
             source_path: path.to_path_buf(),
             source_line: Some(line_no),
-            started_at: string_at(message, &["timestamp", "created_at", "createdAt"])
-                .or_else(|| string_at(&v, &["timestamp", "created_at", "createdAt"]))
-                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                .map(|dt| dt.with_timezone(&Utc)),
+            started_at: timestamp,
             session_name: title.clone(),
             model,
             reasoning_effort: resolve_effort(branch.as_deref(), &branch_effort, &branch_parent),

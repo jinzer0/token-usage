@@ -51,6 +51,18 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
     if area.width >= 80 {
         spans.push(Span::raw("     "));
         spans.push(Span::styled(
+            format!(
+                "today {} · 7d {} · 30d {}",
+                format::token_count(app.snapshot.periods.today.total_tokens),
+                format::token_count(app.snapshot.periods.seven_days.total_tokens),
+                format::token_count(app.snapshot.periods.thirty_days.total_tokens)
+            ),
+            theme.muted_text(),
+        ));
+    }
+    if area.width >= 110 {
+        spans.push(Span::raw("     "));
+        spans.push(Span::styled(
             format!("codex {codex} · gjc {gjc}"),
             theme.muted_text(),
         ));

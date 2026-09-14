@@ -1,4 +1,7 @@
-use crate::aggregate::{AggregateSnapshot, SessionStats};
+use crate::{
+    aggregate::{AggregateSnapshot, SessionStats},
+    time::{GroupBy, bucket_label},
+};
 
 pub fn summary(snapshot: &AggregateSnapshot, verbose: bool) -> String {
     let mut out = String::new();
@@ -35,6 +38,32 @@ pub fn summary(snapshot: &AggregateSnapshot, verbose: bool) -> String {
                 session.record_count
             ));
         }
+    }
+    out
+}
+
+pub fn timeline(snapshot: &AggregateSnapshot, group_by: GroupBy) -> String {
+    let mut out = String::new();
+    out.push_str("date         total       input       output      reasoning   records\n");
+    for bucket in &snapshot.timeline {
+        out.push_str(&format!(
+            "{:<12} {:>10} {:>11} {:>11} {:>11} {:>8}\n",
+            bucket_label(bucket.start, group_by),
+            with_commas(bucket.tokens.total_tokens),
+            with_commas(bucket.tokens.input_total),
+            with_commas(bucket.tokens.output_total),
+            reasoning(&bucket.tokens),
+            bucket.record_count
+        ));
+    }
+    if snapshot.timeline.is_empty() {
+        out.push_str("No timestamped usage records found for this range.\n");
+    }
+    if snapshot.source_counts.records_missing_timestamp_filtered > 0 {
+        out.push_str(&format!(
+            "timestamp_missing_excluded={}\n",
+            snapshot.source_counts.records_missing_timestamp_filtered
+        ));
     }
     out
 }
@@ -94,8 +123,20 @@ fn display_name(session: &SessionStats) -> String {
 
 fn reasoning(tokens: &crate::domain::TokenStats) -> String {
     if tokens.reasoning_has_unknown {
-        format!("{}+", tokens.reasoning_known)
+        format!("{}+", with_commas(tokens.reasoning_known))
     } else {
-        tokens.reasoning_known.to_string()
+        with_commas(tokens.reasoning_known)
     }
+}
+
+fn with_commas(value: u64) -> String {
+    let s = value.to_string();
+    let mut out = String::new();
+    for (idx, ch) in s.chars().rev().enumerate() {
+        if idx > 0 && idx % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
 }
