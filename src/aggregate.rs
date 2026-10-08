@@ -5,7 +5,7 @@ use crate::{
     time::{GroupBy, TimeMatch, TimeSelection, bucket_start},
 };
 use anyhow::Result;
-use chrono::{DateTime, Duration, Local, Utc};
+use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -30,6 +30,16 @@ pub struct SessionStats {
     pub parent: Option<SessionKey>,
     pub name: Option<String>,
     pub started_at: Option<DateTime<Utc>>,
+    pub tokens: TokenStats,
+    pub models: Vec<ModelStats>,
+    pub record_count: u64,
+    #[serde(skip_serializing)]
+    pub daily: Vec<SessionDayStats>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionDayStats {
+    pub day: Option<NaiveDate>,
     pub tokens: TokenStats,
     pub models: Vec<ModelStats>,
     pub record_count: u64,
@@ -165,16 +175,18 @@ pub fn aggregate_with_options(
 }
 
 fn build_session(key: SessionKey, records: Vec<UsageRecord>) -> SessionStats {
-    let mut tokens = TokenStats::default();
+    let mut all = UsageAccumulator::default();
+    let mut days: BTreeMap<Option<NaiveDate>, UsageAccumulator> = BTreeMap::new();
     let mut parent = None;
     let mut name = None;
     let mut started_at: Option<DateTime<Utc>> = None;
-    let mut models_map: BTreeMap<String, BTreeMap<Option<ReasoningEffort>, Vec<UsageRecord>>> =
-        BTreeMap::new();
-    let record_count = records.len() as u64;
 
     for record in records {
-        tokens.add_assign(&record.tokens);
+        all.add_record(&record);
+        let day = record
+            .started_at
+            .map(|t| t.with_timezone(&Local).date_naive());
+        days.entry(day).or_default().add_record(&record);
         parent = parent.or_else(|| record.parent_session_key.clone());
         name = name.or_else(|| record.session_name.clone());
         started_at = match (started_at, record.started_at) {
@@ -182,56 +194,22 @@ fn build_session(key: SessionKey, records: Vec<UsageRecord>) -> SessionStats {
             (None, b) => b,
             (a, None) => a,
         };
-        models_map
-            .entry(record.model.clone())
-            .or_default()
-            .entry(record.reasoning_effort.clone())
-            .or_default()
-            .push(record);
     }
 
-    let mut models = models_map
+    let (tokens, models, record_count) = all.finish();
+    let daily = days
         .into_iter()
-        .map(|(model, efforts_map)| {
-            let mut model_tokens = TokenStats::default();
-            let mut model_count = 0;
-            let mut efforts = efforts_map
-                .into_iter()
-                .map(|(effort, records)| {
-                    let mut effort_tokens = TokenStats::default();
-                    for record in &records {
-                        effort_tokens.add_assign(&record.tokens);
-                    }
-                    model_tokens.add_assign(&effort_tokens);
-                    model_count += records.len() as u64;
-                    EffortStats {
-                        effort,
-                        tokens: effort_tokens,
-                        record_count: records.len() as u64,
-                    }
-                })
-                .collect::<Vec<_>>();
-            efforts.sort_by(|a, b| {
-                b.tokens
-                    .total_tokens
-                    .cmp(&a.tokens.total_tokens)
-                    .then_with(|| effort_label(&a.effort).cmp(&effort_label(&b.effort)))
-            });
-            ModelStats {
-                model,
-                tokens: model_tokens,
-                efforts,
-                record_count: model_count,
+        .rev()
+        .map(|(day, usage)| {
+            let (tokens, models, record_count) = usage.finish();
+            SessionDayStats {
+                day,
+                tokens,
+                models,
+                record_count,
             }
         })
-        .collect::<Vec<_>>();
-    models.sort_by(|a, b| {
-        b.tokens
-            .total_tokens
-            .cmp(&a.tokens.total_tokens)
-            .then_with(|| a.model.cmp(&b.model))
-    });
-
+        .collect();
     SessionStats {
         key,
         parent,
@@ -240,6 +218,72 @@ fn build_session(key: SessionKey, records: Vec<UsageRecord>) -> SessionStats {
         tokens,
         models,
         record_count,
+        daily,
+    }
+}
+
+#[derive(Default)]
+struct UsageAccumulator {
+    tokens: TokenStats,
+    record_count: u64,
+    models: BTreeMap<String, BTreeMap<Option<ReasoningEffort>, (TokenStats, u64)>>,
+}
+
+impl UsageAccumulator {
+    fn add_record(&mut self, record: &UsageRecord) {
+        self.tokens.add_assign(&record.tokens);
+        self.record_count += 1;
+        let (tokens, count) = self
+            .models
+            .entry(record.model.clone())
+            .or_default()
+            .entry(record.reasoning_effort.clone())
+            .or_default();
+        tokens.add_assign(&record.tokens);
+        *count += 1;
+    }
+
+    fn finish(self) -> (TokenStats, Vec<ModelStats>, u64) {
+        let mut models = self
+            .models
+            .into_iter()
+            .map(|(model, efforts_map)| {
+                let mut model_tokens = TokenStats::default();
+                let mut model_count = 0;
+                let mut efforts = efforts_map
+                    .into_iter()
+                    .map(|(effort, (effort_tokens, count))| {
+                        model_tokens.add_assign(&effort_tokens);
+                        model_count += count;
+                        EffortStats {
+                            effort,
+                            tokens: effort_tokens,
+                            record_count: count,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                efforts.sort_by(|a, b| {
+                    b.tokens
+                        .total_tokens
+                        .cmp(&a.tokens.total_tokens)
+                        .then_with(|| effort_label(&a.effort).cmp(&effort_label(&b.effort)))
+                });
+                ModelStats {
+                    model,
+                    tokens: model_tokens,
+                    efforts,
+                    record_count: model_count,
+                }
+            })
+            .collect::<Vec<_>>();
+        models.sort_by(|a, b| {
+            b.tokens
+                .total_tokens
+                .cmp(&a.tokens.total_tokens)
+                .then_with(|| a.model.cmp(&b.model))
+        });
+
+        (self.tokens, models, self.record_count)
     }
 }
 
@@ -280,5 +324,117 @@ pub fn resolve_session<'a>(
             selector: selector.into(),
             candidates: many.iter().map(|s| s.key.qualified()).collect(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{Client, SessionId};
+
+    #[test]
+    fn daily_keeps_local_dates_midnight_and_dst() {
+        let zone = std::env::var("TZ").unwrap_or_default();
+        let cases: Vec<(&str, NaiveDate)> = match zone.as_str() {
+            "Asia/Seoul" => vec![
+                (
+                    "2026-03-10T14:59:59.999Z",
+                    NaiveDate::from_ymd_opt(2026, 3, 10).unwrap(),
+                ),
+                (
+                    "2026-03-10T15:00:00Z",
+                    NaiveDate::from_ymd_opt(2026, 3, 11).unwrap(),
+                ),
+            ],
+            "America/New_York" => vec![
+                (
+                    "2026-03-08T06:59:59.999Z",
+                    NaiveDate::from_ymd_opt(2026, 3, 8).unwrap(),
+                ),
+                (
+                    "2026-03-08T07:00:00Z",
+                    NaiveDate::from_ymd_opt(2026, 3, 8).unwrap(),
+                ),
+                (
+                    "2026-11-01T05:30:00Z",
+                    NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+                ),
+                (
+                    "2026-11-01T06:30:00Z",
+                    NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+                ),
+                (
+                    "2026-10-10T03:59:59.999Z",
+                    NaiveDate::from_ymd_opt(2026, 10, 9).unwrap(),
+                ),
+                (
+                    "2026-10-10T04:00:00Z",
+                    NaiveDate::from_ymd_opt(2026, 10, 10).unwrap(),
+                ),
+            ],
+            "America/Sao_Paulo" => vec![(
+                "2018-11-04T03:30:00Z",
+                NaiveDate::from_ymd_opt(2018, 11, 4).unwrap(),
+            )],
+            _ => {
+                let time = "2026-03-10T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+                vec![(
+                    "2026-03-10T12:00:00Z",
+                    time.with_timezone(&Local).date_naive(),
+                )]
+            }
+        };
+        let mut result = ParseResult::empty(Client::Gjc, "timezone-fixture".into());
+        let mut expected: BTreeMap<NaiveDate, u64> = BTreeMap::new();
+        for (time, day) in &cases {
+            *expected.entry(*day).or_default() += 1;
+            result.records.push(UsageRecord {
+                session_key: SessionKey {
+                    client: Client::Gjc,
+                    id: SessionId("timezone".into()),
+                },
+                parent_session_key: None,
+                message_id: None,
+                source_path: "timezone-fixture".into(),
+                source_line: None,
+                started_at: Some(time.parse().unwrap()),
+                session_name: None,
+                model: "timezone-model".into(),
+                reasoning_effort: None,
+                tokens: TokenStats {
+                    total_tokens: 10,
+                    input_total: 8,
+                    input_uncached: 4,
+                    cache_read: 3,
+                    cache_write: 1,
+                    output_total: 2,
+                    reasoning_known: 1,
+                    reasoning_has_unknown: false,
+                },
+            });
+        }
+        let snapshot = aggregate(vec![result]);
+        let session = &snapshot.sessions[0];
+        assert_eq!(session.daily.len(), expected.len(), "zone {zone}");
+        for bucket in &session.daily {
+            let count = expected.remove(&bucket.day.unwrap()).unwrap();
+            assert_eq!(bucket.record_count, count);
+            assert_eq!(
+                bucket.tokens,
+                TokenStats {
+                    total_tokens: count * 10,
+                    input_total: count * 8,
+                    input_uncached: count * 4,
+                    cache_read: count * 3,
+                    cache_write: count,
+                    output_total: count * 2,
+                    reasoning_known: count,
+                    reasoning_has_unknown: false
+                }
+            );
+            assert_eq!(bucket.models[0].record_count, count);
+        }
+        assert!(expected.is_empty());
+        assert_eq!(session.record_count, cases.len() as u64);
     }
 }

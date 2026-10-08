@@ -10,6 +10,12 @@ use token_usage::{
     time::{self, GroupBy},
 };
 
+use token_usage::{
+    aggregate::{ModelStats, SessionStats},
+    domain::{ReasoningEffort, SessionId, SessionKey, TokenStats, UsageRecord},
+    scan::{ParseResult, ScanSummary},
+};
+
 #[test]
 fn cli_prints_version() {
     let mut cmd = assert_cmd::Command::cargo_bin("token-usage").unwrap();
@@ -269,4 +275,921 @@ fn today_filter_uses_injected_clock_for_non_flaky_tests() {
         time::TimeMatch::Included
     );
     assert_ne!(selection.contains(None), time::TimeMatch::Included);
+}
+
+fn opencode_database(dir: &Path, input: u64, messages: usize) -> std::path::PathBuf {
+    let path = dir.join("opencode.db");
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, title TEXT);
+        CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+        INSERT INTO session VALUES ('root', NULL, 'OpenCode Root'), ('child', 'root', 'Child');").unwrap();
+    for index in 0..messages {
+        let data = serde_json::json!({
+            "role": "assistant", "providerID": "provider", "modelID": "model",
+            "time": {"created": 1_800_000_000_000_i64, "completed": 1_800_000_000_100_i64},
+            "tokens": {"input": input, "output": 0, "reasoning": 0,
+                "cache": {"read": 0, "write": 0}}
+        });
+        db.execute(
+            "INSERT INTO message VALUES (?1, 'child', 1800000000000, ?2)",
+            rusqlite::params![format!("message-{index}"), data.to_string()],
+        )
+        .unwrap();
+    }
+    path
+}
+
+#[test]
+fn opencode_cli_integrates_all_sources_and_root_details() {
+    let dir = tempdir().unwrap();
+    let path = opencode_database(dir.path(), 20, 1);
+    let output = assert_cmd::Command::cargo_bin("token-usage")
+        .unwrap()
+        .args([
+            "--client",
+            "all",
+            "--codex-home",
+            "tests/fixtures/codex",
+            "--gjc-home",
+            "tests/fixtures/gjc",
+            "--json",
+            "--opencode-db",
+        ])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let sessions = json["sessions"].as_array().unwrap();
+    assert!(sessions.iter().any(|s| s["key"]["client"] == "codex"));
+    assert!(sessions.iter().any(|s| s["key"]["client"] == "gjc"));
+    let opencode = sessions
+        .iter()
+        .find(|s| s["key"]["client"] == "opencode")
+        .unwrap();
+    assert_eq!(opencode["key"]["id"], "root");
+    assert_eq!(opencode["tokens"]["total_tokens"], 20);
+    assert_eq!(opencode["models"][0]["model"], "provider/model");
+    assert_cmd::Command::cargo_bin("token-usage")
+        .unwrap()
+        .args(["--client", "opencode", "--opencode-db"])
+        .arg(&path)
+        .arg("opencode:root")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("OpenCode Root"));
+    assert_cmd::Command::cargo_bin("token-usage")
+        .unwrap()
+        .args(["--client", "opencode", "--opencode-db"])
+        .arg(&path)
+        .args(["--group-by", "day"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("20"));
+}
+
+#[test]
+fn explicit_missing_database_is_diagnostic_and_unselected_source_is_not_read() {
+    let dir = tempdir().unwrap();
+    let missing = dir.path().join("missing.db");
+    let output = assert_cmd::Command::cargo_bin("token-usage")
+        .unwrap()
+        .args(["--client", "opencode", "--json", "--opencode-db"])
+        .arg(&missing)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["source_counts"]["errors"], 1);
+    assert!(
+        json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "OpenCodeMissingDatabase" && d["severity"] == "error")
+    );
+    assert!(!missing.exists());
+    let output = assert_cmd::Command::cargo_bin("token-usage")
+        .unwrap()
+        .args([
+            "--client",
+            "gjc",
+            "--gjc-home",
+            "tests/fixtures/gjc",
+            "--json",
+            "--opencode-db",
+        ])
+        .arg(&missing)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["source_counts"]["errors"], 0);
+    assert!(
+        json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|d| d["client"] != "opencode")
+    );
+}
+
+#[test]
+fn cli_rejects_multi_message_aggregate_overflow_before_printing_snapshot() {
+    let dir = tempdir().unwrap();
+    let path = opencode_database(dir.path(), u64::MAX, 2);
+    assert_cmd::Command::cargo_bin("token-usage")
+        .unwrap()
+        .args(["--client", "opencode", "--json", "--opencode-db"])
+        .arg(path)
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicates::str::contains("token aggregate overflow"));
+}
+
+#[test]
+fn opencode_default_paths_honor_xdg_home_and_relative_override() {
+    let dir = tempdir().unwrap();
+    let data = dir.path().join("data");
+    let source = data.join("opencode");
+    fs::create_dir_all(&source).unwrap();
+    let path = opencode_database(&source, 20, 1);
+    let mut default = assert_cmd::Command::cargo_bin("token-usage").unwrap();
+    default
+        .env("XDG_DATA_HOME", &data)
+        .env_remove("OPENCODE_DB")
+        .args(["--client", "opencode", "--json"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("OpenCode Root"));
+    let relative = source.join("custom.db");
+    fs::rename(&path, &relative).unwrap();
+    for value in [std::ffi::OsStr::new("custom.db"), relative.as_os_str()] {
+        assert_cmd::Command::cargo_bin("token-usage")
+            .unwrap()
+            .env("XDG_DATA_HOME", &data)
+            .env("OPENCODE_DB", value)
+            .args(["--client", "opencode", "--json"])
+            .assert()
+            .success()
+            .stdout(predicates::str::contains("OpenCode Root"));
+    }
+    assert_cmd::Command::cargo_bin("token-usage")
+        .unwrap()
+        .env("XDG_DATA_HOME", &data)
+        .env_remove("OPENCODE_DB")
+        .args(["--client", "opencode", "--json"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"severity\": \"warning\""));
+    let home_source = dir.path().join(".local/share/opencode");
+    fs::create_dir_all(&home_source).unwrap();
+    opencode_database(&home_source, 20, 1);
+    assert_cmd::Command::cargo_bin("token-usage")
+        .unwrap()
+        .env("HOME", dir.path())
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("OPENCODE_DB")
+        .args(["--client", "opencode", "--json"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("OpenCode Root"));
+    assert_cmd::Command::cargo_bin("token-usage")
+        .unwrap()
+        .env("OPENCODE_DB", ":memory:")
+        .args(["--client", "opencode", "--json"])
+        .assert()
+        .failure()
+        .stdout("");
+}
+
+#[cfg(unix)]
+#[test]
+fn opencode_default_path_uses_platform_home_without_environment() {
+    const CHILD: &str = "TOKEN_USAGE_PLATFORM_HOME_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "opencode_default_path_uses_platform_home_without_environment",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env_remove("HOME")
+            .env_remove("XDG_DATA_HOME")
+            .env_remove("OPENCODE_DB")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated home resolution failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let home = dirs::home_dir().expect("platform account must have a home directory");
+    assert_eq!(
+        sources::opencode::default_db_path().unwrap(),
+        home.join(".local/share/opencode/opencode.db")
+    );
+    let dir = tempdir().unwrap();
+    let missing = format!(
+        "missing-{}.db",
+        dir.path().file_name().unwrap().to_string_lossy()
+    );
+    assert!(!home.join(".local/share/opencode").join(&missing).exists());
+    let output = assert_cmd::Command::cargo_bin("token-usage")
+        .unwrap()
+        .env("OPENCODE_DB", missing)
+        .args([
+            "--json",
+            "--codex-home",
+            "tests/fixtures/codex",
+            "--gjc-home",
+            "tests/fixtures/gjc",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let snapshot: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let sessions = snapshot["sessions"].as_array().unwrap();
+    for client in ["codex", "gjc"] {
+        assert!(
+            sessions
+                .iter()
+                .any(|session| session["key"]["client"] == client)
+        );
+    }
+    assert!(
+        snapshot["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| {
+                diagnostic["code"] == "OpenCodeMissingDatabase"
+                    && diagnostic["severity"] == "warning"
+            })
+    );
+}
+
+// Numeric fixture order: total, input total, uncached, cache read, cache write,
+// output total, known reasoning. Equality includes the unknown-reasoning flag.
+fn daily_tokens(values: [u64; 7], unknown: bool) -> TokenStats {
+    TokenStats {
+        total_tokens: values[0],
+        input_total: values[1],
+        input_uncached: values[2],
+        cache_read: values[3],
+        cache_write: values[4],
+        output_total: values[5],
+        reasoning_known: values[6],
+        reasoning_has_unknown: unknown,
+    }
+}
+
+fn daily_local_noon(day: u32) -> chrono::DateTime<Utc> {
+    chrono::Local
+        .with_ymd_and_hms(2026, 9, day, 12, 0, 0)
+        .single()
+        .unwrap()
+        .with_timezone(&Utc)
+}
+
+fn daily_record(
+    client: Client,
+    id: &str,
+    timestamp: Option<chrono::DateTime<Utc>>,
+    model: &str,
+    effort: Option<ReasoningEffort>,
+    tokens: TokenStats,
+) -> UsageRecord {
+    UsageRecord {
+        session_key: SessionKey {
+            client,
+            id: SessionId(id.into()),
+        },
+        parent_session_key: None,
+        message_id: None,
+        source_path: "daily-test".into(),
+        source_line: None,
+        started_at: timestamp,
+        session_name: Some("Daily fixture".into()),
+        model: model.into(),
+        reasoning_effort: effort,
+        tokens,
+    }
+}
+
+fn daily_parsed(records: Vec<UsageRecord>) -> ParseResult {
+    ParseResult {
+        summary: ScanSummary {
+            records_emitted: records.len() as u64,
+            ..Default::default()
+        },
+        records,
+        diagnostics: Vec::new(),
+    }
+}
+
+type DailyExpectedModel<'a> = (
+    &'a str,
+    TokenStats,
+    u64,
+    Vec<(Option<ReasoningEffort>, TokenStats, u64)>,
+);
+
+fn daily_assert_models(actual: &[ModelStats], expected: Vec<DailyExpectedModel<'_>>) {
+    assert_eq!(actual.len(), expected.len());
+    for (model, (name, tokens, count, efforts)) in actual.iter().zip(expected) {
+        assert_eq!(model.model, name);
+        assert_eq!(model.tokens, tokens, "model {name}");
+        assert_eq!(model.record_count, count, "model {name}");
+        assert_eq!(model.efforts.len(), efforts.len(), "model {name}");
+        for (effort, (key, tokens, count)) in model.efforts.iter().zip(efforts) {
+            assert_eq!(effort.effort, key, "model {name}");
+            assert_eq!(effort.tokens, tokens, "model {name}, effort {key:?}");
+            assert_eq!(effort.record_count, count, "model {name}, effort {key:?}");
+        }
+    }
+}
+
+fn daily_assert_partition(session: &SessionStats) {
+    use std::collections::BTreeMap;
+    let mut tokens = TokenStats::default();
+    let mut count = 0;
+    let mut models = BTreeMap::new();
+    let mut efforts = BTreeMap::new();
+    for day in &session.daily {
+        tokens.add_assign(&day.tokens);
+        count += day.record_count;
+        for model in &day.models {
+            let entry = models
+                .entry(model.model.clone())
+                .or_insert((TokenStats::default(), 0));
+            entry.0.add_assign(&model.tokens);
+            entry.1 += model.record_count;
+            for effort in &model.efforts {
+                let entry = efforts
+                    .entry((model.model.clone(), effort.effort.clone()))
+                    .or_insert((TokenStats::default(), 0));
+                entry.0.add_assign(&effort.tokens);
+                entry.1 += effort.record_count;
+            }
+        }
+    }
+    assert_eq!(tokens, session.tokens);
+    assert_eq!(count, session.record_count);
+    assert_eq!(models.len(), session.models.len());
+    for model in &session.models {
+        assert_eq!(
+            models.remove(&model.model),
+            Some((model.tokens.clone(), model.record_count))
+        );
+        for effort in &model.efforts {
+            assert_eq!(
+                efforts.remove(&(model.model.clone(), effort.effort.clone())),
+                Some((effort.tokens.clone(), effort.record_count))
+            );
+        }
+    }
+    assert!(models.is_empty());
+    assert!(efforts.is_empty());
+}
+
+#[test]
+fn daily_session_canonical_partition_models_efforts_and_zero_records() {
+    let a = daily_tokens([10, 7, 4, 2, 1, 3, 0], false);
+    let b = daily_tokens([10, 6, 3, 2, 1, 4, 0], true);
+    let c = daily_tokens([10, 5, 2, 2, 1, 5, 2], false);
+    let d = daily_tokens([20, 14, 8, 4, 2, 6, 3], false);
+    let known_zero = daily_tokens([0; 7], false);
+    let unknown_zero = daily_tokens([0; 7], true);
+    let custom = Some(ReasoningEffort::Custom("ultra".into()));
+    let snapshot = aggregate(vec![daily_parsed(vec![
+        daily_record(
+            Client::Gjc,
+            "daily",
+            Some(daily_local_noon(11)),
+            "alpha",
+            None,
+            a.clone(),
+        ),
+        daily_record(
+            Client::Gjc,
+            "daily",
+            Some(daily_local_noon(11)),
+            "alpha",
+            custom.clone(),
+            b.clone(),
+        ),
+        daily_record(
+            Client::Gjc,
+            "daily",
+            Some(daily_local_noon(11)),
+            "beta",
+            None,
+            c.clone(),
+        ),
+        daily_record(
+            Client::Gjc,
+            "daily",
+            Some(daily_local_noon(12)),
+            "alpha",
+            Some(ReasoningEffort::High),
+            d.clone(),
+        ),
+        daily_record(
+            Client::Gjc,
+            "daily",
+            Some(daily_local_noon(12)),
+            "zero",
+            None,
+            known_zero.clone(),
+        ),
+        daily_record(
+            Client::Gjc,
+            "daily",
+            None,
+            "alpha",
+            custom.clone(),
+            unknown_zero.clone(),
+        ),
+    ])]);
+    assert_eq!(snapshot.sessions.len(), 1);
+    let session = &snapshot.sessions[0];
+    assert_eq!(
+        session.tokens,
+        daily_tokens([50, 32, 17, 10, 5, 18, 5], true)
+    );
+    assert_eq!(session.record_count, 6);
+    assert_eq!(
+        session.daily.iter().map(|d| d.day).collect::<Vec<_>>(),
+        vec![
+            chrono::NaiveDate::from_ymd_opt(2026, 9, 12),
+            chrono::NaiveDate::from_ymd_opt(2026, 9, 11),
+            None,
+        ]
+    );
+    daily_assert_models(
+        &session.models,
+        vec![
+            (
+                "alpha",
+                daily_tokens([40, 27, 15, 8, 4, 13, 3], true),
+                4,
+                vec![
+                    (Some(ReasoningEffort::High), d.clone(), 1),
+                    (custom.clone(), b.clone(), 2),
+                    (None, a.clone(), 1),
+                ],
+            ),
+            ("beta", c.clone(), 1, vec![(None, c.clone(), 1)]),
+            (
+                "zero",
+                known_zero.clone(),
+                1,
+                vec![(None, known_zero.clone(), 1)],
+            ),
+        ],
+    );
+    assert_eq!(session.daily[0].tokens, d);
+    assert_eq!(session.daily[0].record_count, 2);
+    daily_assert_models(
+        &session.daily[0].models,
+        vec![
+            (
+                "alpha",
+                d.clone(),
+                1,
+                vec![(Some(ReasoningEffort::High), d, 1)],
+            ),
+            ("zero", known_zero.clone(), 1, vec![(None, known_zero, 1)]),
+        ],
+    );
+    assert_eq!(
+        session.daily[1].tokens,
+        daily_tokens([30, 18, 9, 6, 3, 12, 2], true)
+    );
+    assert_eq!(session.daily[1].record_count, 3);
+    daily_assert_models(
+        &session.daily[1].models,
+        vec![
+            (
+                "alpha",
+                daily_tokens([20, 13, 7, 4, 2, 7, 0], true),
+                2,
+                vec![(custom.clone(), b, 1), (None, a, 1)],
+            ),
+            ("beta", c.clone(), 1, vec![(None, c, 1)]),
+        ],
+    );
+    assert_eq!(session.daily[2].tokens, unknown_zero);
+    assert_eq!(session.daily[2].record_count, 1);
+    daily_assert_models(
+        &session.daily[2].models,
+        vec![(
+            "alpha",
+            unknown_zero.clone(),
+            1,
+            vec![(custom, unknown_zero, 1)],
+        )],
+    );
+    daily_assert_partition(session);
+}
+
+#[test]
+fn daily_session_three_sources_root_identity_partition_and_json_shape() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fixture.db");
+    {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch(include_str!("fixtures/opencode/schema.sql"))
+            .unwrap();
+        db.execute_batch(include_str!("fixtures/opencode/usage.sql"))
+            .unwrap();
+    }
+    let codex = sources::codex::parse(Path::new("tests/fixtures/codex")).unwrap();
+    let gjc = sources::gjc::parse(Path::new("tests/fixtures/gjc")).unwrap();
+    let opencode = sources::opencode::parse(&path).unwrap();
+    assert_eq!(opencode.records.len(), 4);
+    assert!(
+        opencode
+            .records
+            .iter()
+            .all(|r| r.session_key.qualified() == "opencode:abc")
+    );
+    assert!(
+        opencode
+            .records
+            .iter()
+            .all(|r| r.parent_session_key.is_none())
+    );
+    let snapshot = aggregate(vec![codex, gjc, opencode]);
+    assert_eq!(snapshot.sessions.len(), 3);
+    assert!(matches!(
+        resolve_session(&snapshot, "abc"),
+        Err(token_usage::aggregate::SelectorError::Ambiguous { .. })
+    ));
+    let codex = resolve_session(&snapshot, "codex:abc").unwrap();
+    let gjc = resolve_session(&snapshot, "gjc:same").unwrap();
+    let opencode = resolve_session(&snapshot, "opencode:abc").unwrap();
+    let codex_tokens = daily_tokens([150, 100, 80, 20, 0, 40, 10], false);
+    let gjc_tokens = daily_tokens([75, 50, 50, 0, 0, 25, 5], false);
+    let opencode_tokens = daily_tokens([197, 141, 112, 24, 5, 56, 8], false);
+    let anthropic = daily_tokens([192, 139, 110, 24, 5, 53, 8], false);
+    let other = daily_tokens([5, 2, 2, 0, 0, 3, 0], false);
+    assert_eq!(codex.tokens, codex_tokens);
+    assert_eq!(codex.record_count, 2);
+    assert_eq!(codex.daily.len(), 1);
+    assert_eq!(codex.daily[0].day, None);
+    daily_assert_models(
+        &codex.daily[0].models,
+        vec![(
+            "gpt-5",
+            codex_tokens.clone(),
+            2,
+            vec![(Some(ReasoningEffort::High), codex_tokens, 2)],
+        )],
+    );
+    assert_eq!(gjc.tokens, gjc_tokens);
+    assert_eq!(gjc.record_count, 1);
+    assert_eq!(gjc.daily.len(), 1);
+    assert_eq!(
+        gjc.daily[0].day,
+        Some(
+            Utc.with_ymd_and_hms(2026, 9, 11, 0, 0, 0)
+                .unwrap()
+                .with_timezone(&chrono::Local)
+                .date_naive()
+        )
+    );
+    daily_assert_models(
+        &gjc.daily[0].models,
+        vec![(
+            "claude",
+            gjc_tokens.clone(),
+            1,
+            vec![(Some(ReasoningEffort::Medium), gjc_tokens, 1)],
+        )],
+    );
+    assert_eq!(opencode.tokens, opencode_tokens);
+    assert_eq!(opencode.record_count, 4);
+    assert_eq!(opencode.name.as_deref(), Some("Root without usage"));
+    assert_eq!(opencode.parent, None);
+    assert_eq!(
+        opencode.started_at,
+        chrono::DateTime::<Utc>::from_timestamp_millis(0)
+    );
+    assert_eq!(opencode.daily.len(), 1);
+    assert_eq!(
+        opencode.daily[0].day,
+        Some(
+            chrono::DateTime::<Utc>::from_timestamp_millis(0)
+                .unwrap()
+                .with_timezone(&chrono::Local)
+                .date_naive()
+        )
+    );
+    daily_assert_models(
+        &opencode.daily[0].models,
+        vec![
+            (
+                "anthropic/model",
+                anthropic.clone(),
+                3,
+                vec![(None, anthropic, 3)],
+            ),
+            ("other/model", other.clone(), 1, vec![(None, other, 1)]),
+        ],
+    );
+    for session in &snapshot.sessions {
+        daily_assert_partition(session);
+        assert_eq!(session.daily[0].tokens, session.tokens);
+        assert_eq!(session.daily[0].record_count, session.record_count);
+    }
+
+    let json = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(json.as_object().unwrap().len(), 6);
+    for field in [
+        "generated_at",
+        "sessions",
+        "timeline",
+        "periods",
+        "diagnostics",
+        "source_counts",
+    ] {
+        assert!(json.get(field).is_some(), "missing snapshot field {field}");
+    }
+    for (value, session) in json["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(&snapshot.sessions)
+    {
+        assert_eq!(value.as_object().unwrap().len(), 7);
+        assert!(value.get("daily").is_none());
+        assert_eq!(value["key"], serde_json::to_value(&session.key).unwrap());
+        assert_eq!(
+            value["parent"],
+            serde_json::to_value(&session.parent).unwrap()
+        );
+        assert_eq!(value["name"], serde_json::to_value(&session.name).unwrap());
+        assert_eq!(
+            value["started_at"],
+            serde_json::to_value(session.started_at).unwrap()
+        );
+        assert_eq!(
+            value["tokens"],
+            serde_json::to_value(&session.tokens).unwrap()
+        );
+        assert_eq!(value["record_count"], session.record_count);
+        assert_eq!(
+            value["models"],
+            serde_json::to_value(&session.models).unwrap()
+        );
+        let model = &value["models"][0];
+        assert!(model.get("daily").is_none());
+        assert_eq!(model.as_object().unwrap().len(), 4);
+        assert_eq!(model["tokens"].as_object().unwrap().len(), 8);
+        assert_eq!(model["efforts"][0].as_object().unwrap().len(), 3);
+    }
+}
+
+#[test]
+fn daily_session_time_selection_partial_day_and_grouping_undated_counter() {
+    let since = daily_local_noon(11);
+    let until = since + chrono::Duration::hours(2);
+    let a = daily_tokens([10, 7, 4, 2, 1, 3, 0], false);
+    let b = daily_tokens([10, 6, 3, 2, 1, 4, 0], true);
+    let c = daily_tokens([10, 5, 2, 2, 1, 5, 2], false);
+    let d = daily_tokens([20, 14, 8, 4, 2, 6, 3], false);
+    let parsed = daily_parsed(vec![
+        daily_record(
+            Client::Gjc,
+            "dated",
+            Some(since - chrono::Duration::milliseconds(1)),
+            "alpha",
+            None,
+            a,
+        ),
+        daily_record(Client::Gjc, "dated", Some(since), "alpha", None, b.clone()),
+        daily_record(
+            Client::Gjc,
+            "dated",
+            Some(until - chrono::Duration::milliseconds(1)),
+            "beta",
+            None,
+            c.clone(),
+        ),
+        daily_record(Client::Gjc, "dated", Some(until), "alpha", None, d),
+        daily_record(
+            Client::Gjc,
+            "undated-only",
+            None,
+            "zero",
+            None,
+            daily_tokens([0; 7], true),
+        ),
+    ]);
+    let filtered = aggregate_with_options(
+        vec![parsed.clone()],
+        &AggregateOptions {
+            time_selection: time::TimeSelection {
+                since: Some(since),
+                until: Some(until),
+            },
+            group_by: Some(GroupBy::Day),
+        },
+    )
+    .unwrap();
+    assert_eq!(filtered.source_counts.records_time_filtered, 2);
+    assert_eq!(filtered.source_counts.records_missing_timestamp_filtered, 1);
+    assert_eq!(filtered.sessions.len(), 1);
+    let session = &filtered.sessions[0];
+    assert_eq!(session.tokens, daily_tokens([20, 11, 5, 4, 2, 9, 2], true));
+    assert_eq!(session.record_count, 2);
+    assert_eq!(session.daily.len(), 1);
+    assert_eq!(
+        session.daily[0].day,
+        chrono::NaiveDate::from_ymd_opt(2026, 9, 11)
+    );
+    assert_eq!(
+        session.daily[0].tokens,
+        daily_tokens([20, 11, 5, 4, 2, 9, 2], true)
+    );
+    assert_eq!(session.daily[0].record_count, 2);
+    daily_assert_models(
+        &session.daily[0].models,
+        vec![
+            ("alpha", b.clone(), 1, vec![(None, b, 1)]),
+            ("beta", c.clone(), 1, vec![(None, c, 1)]),
+        ],
+    );
+    daily_assert_partition(session);
+    assert_eq!(filtered.timeline.len(), 1);
+    assert_eq!(filtered.timeline[0].tokens, session.tokens);
+    assert_eq!(filtered.timeline[0].record_count, 2);
+
+    let grouped = aggregate_with_options(
+        vec![parsed],
+        &AggregateOptions {
+            time_selection: Default::default(),
+            group_by: Some(GroupBy::Day),
+        },
+    )
+    .unwrap();
+    assert_eq!(grouped.source_counts.records_time_filtered, 0);
+    assert_eq!(grouped.source_counts.records_missing_timestamp_filtered, 1);
+    assert_eq!(grouped.sessions.len(), 2);
+    assert_eq!(grouped.timeline.len(), 1);
+    assert_eq!(
+        grouped.timeline[0].tokens,
+        daily_tokens([50, 32, 17, 10, 5, 18, 5], true)
+    );
+    assert_eq!(grouped.timeline[0].record_count, 4);
+    let undated = resolve_session(&grouped, "gjc:undated-only").unwrap();
+    assert_eq!(undated.tokens, daily_tokens([0; 7], true));
+    assert_eq!(undated.record_count, 1);
+    assert_eq!(undated.daily.len(), 1);
+    assert_eq!(undated.daily[0].day, None);
+    daily_assert_models(
+        &undated.daily[0].models,
+        vec![(
+            "zero",
+            daily_tokens([0; 7], true),
+            1,
+            vec![(None, daily_tokens([0; 7], true), 1)],
+        )],
+    );
+    for session in &grouped.sessions {
+        daily_assert_partition(session);
+    }
+}
+
+#[test]
+fn daily_session_fixed_instants_local_midnight_and_dst() {
+    const CHILD_GUARD: &str = "TOKEN_USAGE_DAILY_TIMEZONE_TEST_CHILD";
+    let zone = std::env::var("TZ").unwrap_or_default();
+    if !matches!(zone.as_str(), "Asia/Seoul" | "America/New_York" | "UTC") {
+        assert!(
+            std::env::var_os(CHILD_GUARD).is_none(),
+            "timezone test child has unsupported TZ={zone:?}"
+        );
+        let executable = std::env::current_exe().unwrap();
+        for child_zone in ["Asia/Seoul", "America/New_York", "UTC"] {
+            let output = std::process::Command::new(&executable)
+                .args([
+                    "--exact",
+                    "daily_session_fixed_instants_local_midnight_and_dst",
+                    "--nocapture",
+                ])
+                .env("TZ", child_zone)
+                .env(CHILD_GUARD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "timezone test failed for TZ={child_zone}:\n{stdout}\n{stderr}"
+            );
+            assert!(
+                stdout.contains("running 1 test") && stdout.contains("1 passed"),
+                "timezone child did not execute exactly one passing test for TZ={child_zone}:\n{stdout}\n{stderr}"
+            );
+        }
+        return;
+    }
+    let dates = match zone.as_str() {
+        "Asia/Seoul" => [
+            "2026-09-11",
+            "2026-09-12",
+            "2026-03-08",
+            "2026-03-08",
+            "2026-11-01",
+            "2026-11-01",
+        ],
+        "America/New_York" | "UTC" => [
+            "2026-09-11",
+            "2026-09-11",
+            "2026-03-08",
+            "2026-03-08",
+            "2026-11-01",
+            "2026-11-01",
+        ],
+        other => panic!("unsupported TZ={other}; use Asia/Seoul, America/New_York or UTC"),
+    };
+    let instants = [
+        "2026-09-11T14:59:59.999Z",
+        "2026-09-11T15:00:00.001Z",
+        "2026-03-08T06:59:59.999Z",
+        "2026-03-08T07:00:00Z",
+        "2026-11-01T05:30:00Z",
+        "2026-11-01T06:30:00Z",
+    ];
+    let a = daily_tokens([10, 7, 4, 2, 1, 3, 0], false);
+    let b = daily_tokens([10, 6, 3, 2, 1, 4, 0], true);
+    let c = daily_tokens([10, 5, 2, 2, 1, 5, 2], false);
+    let d = daily_tokens([20, 14, 8, 4, 2, 6, 3], false);
+    let stats = [a.clone(), b.clone(), c, d, a.clone(), b.clone()];
+    let records = instants
+        .iter()
+        .zip(&dates)
+        .zip(stats)
+        .map(|((instant, date), tokens)| {
+            let timestamp = chrono::DateTime::parse_from_rfc3339(instant)
+                .unwrap()
+                .with_timezone(&Utc);
+            assert_eq!(
+                timestamp
+                    .with_timezone(&chrono::Local)
+                    .date_naive()
+                    .to_string(),
+                *date,
+                "process timezone must match TZ={zone}"
+            );
+            daily_record(Client::Codex, "fixed", Some(timestamp), "m", None, tokens)
+        })
+        .collect();
+    let snapshot = aggregate(vec![daily_parsed(records)]);
+    let session = &snapshot.sessions[0];
+    let mut expected = vec![("2026-11-01", daily_tokens([20, 13, 7, 4, 2, 7, 0], true), 2)];
+    if zone == "Asia/Seoul" {
+        expected.push(("2026-09-12", b, 1));
+        expected.push(("2026-09-11", a, 1));
+    } else {
+        expected.push(("2026-09-11", daily_tokens([20, 13, 7, 4, 2, 7, 0], true), 2));
+    }
+    expected.push((
+        "2026-03-08",
+        daily_tokens([30, 19, 10, 6, 3, 11, 5], false),
+        2,
+    ));
+    assert_eq!(
+        session.tokens,
+        daily_tokens([70, 45, 24, 14, 7, 25, 5], true)
+    );
+    assert_eq!(session.record_count, 6);
+    assert_eq!(session.daily.len(), expected.len());
+    for (day, (date, tokens, count)) in session.daily.iter().zip(expected) {
+        assert_eq!(day.day.unwrap().to_string(), date);
+        assert_eq!(day.tokens, tokens);
+        assert_eq!(day.record_count, count);
+        daily_assert_models(
+            &day.models,
+            vec![("m", tokens.clone(), count, vec![(None, tokens, count)])],
+        );
+    }
+    daily_assert_partition(session);
 }

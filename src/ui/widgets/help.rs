@@ -7,19 +7,20 @@ use ratatui::{
 };
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
-    let popup = centered(area, 48, 13);
-    frame.render_widget(Clear, popup);
     let lines = vec![
-        Line::styled("Navigation", theme.title()),
         hint(theme, "j / ↓", "next session"),
         hint(theme, "k / ↑", "previous session"),
         hint(theme, "J / PgDn", "scroll detail down"),
         hint(theme, "K / PgUp", "scroll detail up"),
         hint(theme, "/", "search sessions"),
         hint(theme, "v", "toggle token breakdown"),
+        hint(theme, "d", "select usage date"),
+        hint(theme, "↑↓/Enter/Esc", "pick/apply/cancel"),
         hint(theme, "r", "reload"),
         hint(theme, "? / Esc / q", "close help"),
     ];
+    let popup = centered(area, 48, lines.len().saturating_add(2) as u16);
+    frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
@@ -40,8 +41,8 @@ fn hint(theme: &Theme, key: &'static str, label: &'static str) -> Line<'static> 
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(area.width.saturating_sub(2)).max(1);
-    let height = height.min(area.height.saturating_sub(2)).max(1);
+    let width = width.min(area.width);
+    let height = height.min(area.height);
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

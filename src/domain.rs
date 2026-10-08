@@ -7,6 +7,7 @@ use std::{fmt, path::PathBuf};
 pub enum Client {
     Codex,
     Gjc,
+    OpenCode,
 }
 
 impl fmt::Display for Client {
@@ -14,6 +15,7 @@ impl fmt::Display for Client {
         f.write_str(match self {
             Client::Codex => "codex",
             Client::Gjc => "gjc",
+            Client::OpenCode => "opencode",
         })
     }
 }

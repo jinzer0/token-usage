@@ -67,6 +67,11 @@ impl Theme {
             .fg(Color::Magenta)
             .add_modifier(Modifier::BOLD)
     }
+    pub fn client_opencode(&self) -> Style {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    }
     pub fn bar_full(&self) -> Style {
         Style::default().fg(Color::Cyan)
     }
