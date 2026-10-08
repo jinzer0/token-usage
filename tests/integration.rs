@@ -470,6 +470,79 @@ fn opencode_default_paths_honor_xdg_home_and_relative_override() {
         .stdout("");
 }
 
+#[cfg(unix)]
+#[test]
+fn opencode_default_path_uses_platform_home_without_environment() {
+    const CHILD: &str = "TOKEN_USAGE_PLATFORM_HOME_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "opencode_default_path_uses_platform_home_without_environment",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env_remove("HOME")
+            .env_remove("XDG_DATA_HOME")
+            .env_remove("OPENCODE_DB")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated home resolution failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let home = dirs::home_dir().expect("platform account must have a home directory");
+    assert_eq!(
+        sources::opencode::default_db_path().unwrap(),
+        home.join(".local/share/opencode/opencode.db")
+    );
+    let dir = tempdir().unwrap();
+    let missing = format!(
+        "missing-{}.db",
+        dir.path().file_name().unwrap().to_string_lossy()
+    );
+    assert!(!home.join(".local/share/opencode").join(&missing).exists());
+    let output = assert_cmd::Command::cargo_bin("token-usage")
+        .unwrap()
+        .env("OPENCODE_DB", missing)
+        .args([
+            "--json",
+            "--codex-home",
+            "tests/fixtures/codex",
+            "--gjc-home",
+            "tests/fixtures/gjc",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let snapshot: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let sessions = snapshot["sessions"].as_array().unwrap();
+    for client in ["codex", "gjc"] {
+        assert!(
+            sessions
+                .iter()
+                .any(|session| session["key"]["client"] == client)
+        );
+    }
+    assert!(
+        snapshot["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| {
+                diagnostic["code"] == "OpenCodeMissingDatabase"
+                    && diagnostic["severity"] == "warning"
+            })
+    );
+}
+
 // Numeric fixture order: total, input total, uncached, cache read, cache write,
 // output total, known reasoning. Equality includes the unknown-reasoning flag.
 fn daily_tokens(values: [u64; 7], unknown: bool) -> TokenStats {

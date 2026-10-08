@@ -25,12 +25,9 @@ pub fn default_db_path() -> Result<PathBuf> {
     }
     let data_dir = match env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
         Some(value) => PathBuf::from(value),
-        None => PathBuf::from(
-            env::var_os("HOME")
-                .filter(|v| !v.is_empty())
-                .context("OpenCode default database path requires XDG_DATA_HOME or HOME")?,
-        )
-        .join(".local/share"),
+        None => dirs::home_dir()
+            .context("OpenCode default database path requires XDG_DATA_HOME or a home directory")?
+            .join(".local/share"),
     };
     Ok(match override_path {
         Some(value) => data_dir.join("opencode").join(value),
