@@ -12,16 +12,28 @@ use ratatui::{
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, mode: LayoutMode) {
     if let Some(error) = &app.footer_error {
+        let action = if app.date_picker.is_some() {
+            "Esc cancel · "
+        } else {
+            "r retry · q quit · "
+        };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(" ERROR ", theme.error()),
+                Span::styled(action, theme.key_hint()),
                 Span::styled(error.clone(), theme.error()),
-                Span::raw("    "),
-                Span::styled("r", theme.key_hint()),
-                Span::styled(" retry · ", theme.muted_text()),
-                Span::styled("q", theme.key_hint()),
-                Span::styled(" quit", theme.muted_text()),
             ])),
+            area,
+        );
+        return;
+    }
+
+    if app.date_picker.is_some() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                " ↑↓ date · Enter apply · Esc cancel",
+                theme.key_hint(),
+            )),
             area,
         );
         return;
@@ -33,6 +45,26 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, mode:
                 Span::styled(" Search: ", theme.key_hint()),
                 Span::styled(app.search.query.clone(), theme.primary_text()),
                 Span::styled("  Enter accept · Esc cancel", theme.muted_text()),
+            ])),
+            area,
+        );
+        return;
+    }
+
+    if let Some(notice) = &app.footer_notice {
+        let hints = if app.date_picker_available {
+            " d date r reload q quit"
+        } else {
+            " r reload q quit"
+        };
+        let width = area.width.saturating_sub(hints.len() as u16) as usize;
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    crate::ui::format::truncate_ellipsis(notice, width),
+                    theme.muted_text(),
+                ),
+                Span::styled(hints, theme.key_hint()),
             ])),
             area,
         );
@@ -53,6 +85,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, mode:
         push_hint(&mut spans, theme, "↑↓/jk", "navigate");
     }
     push_hint(&mut spans, theme, "/", "search");
+    if app.date_picker_available {
+        push_hint(&mut spans, theme, "d", "date");
+    }
     push_hint(&mut spans, theme, "J/K", "scroll");
     push_hint(
         &mut spans,

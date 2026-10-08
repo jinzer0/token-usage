@@ -1,13 +1,18 @@
 use crate::{
     aggregate::{ModelStats, SessionStats},
     domain::{Client, ReasoningEffort, TokenStats},
-    ui::{app::App, format, layout::LayoutMode, theme::Theme},
+    ui::{
+        app::{App, DetailScope},
+        format,
+        layout::LayoutMode,
+        theme::Theme,
+    },
 };
 use ratatui::{
     Frame,
     layout::Rect,
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, mode: LayoutMode) {
@@ -15,10 +20,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, mode:
         let text = vec![
             Line::styled("No usage sessions found.", theme.title()),
             Line::raw(""),
-            Line::styled(
-                "Scanned Codex and GJC local session stores.",
-                theme.muted_text(),
-            ),
+            Line::styled("Local stores: Codex, GJC, OpenCode.", theme.muted_text()),
             Line::styled("Press r to refresh.", theme.muted_text()),
         ];
         frame.render_widget(
@@ -50,13 +52,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, mode:
     );
     let lines = detail_lines(
         session,
+        app.detail_scope,
         theme,
         app.breakdown,
         mode,
         area.width.saturating_sub(2) as usize,
     );
     let paragraph = Paragraph::new(lines)
-        .scroll((app.detail_scroll as u16, 0))
+        .scroll((app.detail_scroll.min(u16::MAX as usize) as u16, 0))
         .wrap(Wrap { trim: false })
         .block(
             Block::default()
@@ -65,19 +68,97 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, mode:
                 .title(title),
         );
     frame.render_widget(paragraph, area);
+    render_date_picker(frame, area, app, theme);
+}
+
+pub(super) fn picker_available(area: Rect) -> bool {
+    area.width >= 16 && area.height >= 3
+}
+
+fn render_date_picker(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+    let Some(picker) = &app.date_picker else {
+        return;
+    };
+    if !picker_available(area) {
+        return;
+    }
+    let width = area.width.min(44);
+    let height = area.height.min(12).min(
+        picker
+            .options
+            .len()
+            .saturating_add(2)
+            .min(u16::MAX as usize) as u16,
+    );
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    let rows = height.saturating_sub(2) as usize;
+    let start = picker
+        .cursor
+        .saturating_sub(rows / 2)
+        .min(picker.options.len().saturating_sub(rows));
+    let lines = picker
+        .options
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(rows)
+        .map(|(index, scope)| {
+            let style = if index == picker.cursor {
+                theme
+                    .primary_text()
+                    .add_modifier(ratatui::style::Modifier::REVERSED)
+            } else {
+                theme.primary_text()
+            };
+            Line::styled(scope.label(), style)
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme.border())
+                .title("Usage date"),
+        ),
+        popup,
+    );
 }
 
 fn detail_lines(
     session: &SessionStats,
+    scope: DetailScope,
     theme: &Theme,
     breakdown: bool,
     mode: LayoutMode,
     width: usize,
 ) -> Vec<Line<'static>> {
+    let (tokens, models) = match scope {
+        DetailScope::All => (&session.tokens, session.models.as_slice()),
+        scope => {
+            let day = match scope {
+                DetailScope::Day(day) => Some(day),
+                _ => None,
+            };
+            let Some(bucket) = session.daily.iter().find(|bucket| bucket.day == day) else {
+                return vec![
+                    Line::styled(scope.label(), theme.title()),
+                    Line::raw("No usage records in this date range."),
+                ];
+            };
+            (&bucket.tokens, bucket.models.as_slice())
+        }
+    };
     let mut lines = Vec::new();
     let client = match session.key.client {
         Client::Codex => "CODEX",
         Client::Gjc => "GJC",
+        Client::OpenCode => "OPENCODE",
     };
     lines.push(Line::from(vec![
         Span::styled(
@@ -85,34 +166,36 @@ fn detail_lines(
             match session.key.client {
                 Client::Codex => theme.client_codex(),
                 Client::Gjc => theme.client_gjc(),
+                Client::OpenCode => theme.client_opencode(),
             },
         ),
         Span::raw(" "),
         Span::styled(
             format::pad_left(
-                &format::token_count(session.tokens.total_tokens),
+                &format::token_count(tokens.total_tokens),
                 width.saturating_sub(client.len() + 1),
             ),
             theme.number(),
         ),
     ]));
+    lines.push(Line::styled(scope.label(), theme.muted_text()));
     lines.push(Line::raw(""));
 
-    for (idx, model) in session.models.iter().enumerate() {
+    for (idx, model) in models.iter().enumerate() {
         if idx > 0 {
             lines.push(Line::raw(""));
         }
         push_model(
             lines.as_mut(),
             model,
-            session.tokens.total_tokens,
+            tokens.total_tokens,
             theme,
             breakdown,
             mode,
             width,
         );
     }
-    if session.models.is_empty() {
+    if models.is_empty() {
         lines.push(Line::styled(
             "No model usage records in this session.",
             theme.muted_text(),
@@ -304,8 +387,16 @@ mod tests {
                 }],
             }],
             record_count: 1,
+            daily: vec![],
         };
-        let lines = detail_lines(&session, &Theme::default(), false, LayoutMode::Wide, 80);
+        let lines = detail_lines(
+            &session,
+            DetailScope::All,
+            &Theme::default(),
+            false,
+            LayoutMode::Wide,
+            80,
+        );
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -314,5 +405,49 @@ mod tests {
         assert!(text.contains("gpt"));
         assert!(text.contains("xhigh"));
         assert!(text.contains("reasoning"));
+    }
+
+    #[test]
+    fn daily_detail_uses_scoped_models_denominators_and_breakdown() {
+        let snapshot = crate::ui::app::daily_test_snapshot([true; 3]);
+        let session = &snapshot.sessions[0];
+        let day = session.daily[0].day.unwrap();
+        let text = |scope, breakdown, mode, width| {
+            detail_lines(session, scope, &Theme::default(), breakdown, mode, width)
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let all = text(DetailScope::All, false, LayoutMode::Wide, 100);
+        assert!(all.contains("day-old") && all.contains("day-new") && all.contains("day-unknown"));
+        assert!(all.contains("27%"));
+        let selected = text(DetailScope::Day(day), true, LayoutMode::Wide, 100);
+        assert!(
+            selected.contains("Local") && selected.contains("day-new") && selected.contains("300")
+        );
+        assert!(
+            selected.contains("100%") && selected.contains("INPUT") && selected.contains("20+")
+        );
+        assert!(
+            !selected.contains("day-old")
+                && !selected.contains("day-unknown")
+                && !selected.contains("27%")
+        );
+        let undated = text(DetailScope::Undated, true, LayoutMode::Narrow, 38);
+        assert!(
+            undated.contains("Unknown date")
+                && undated.contains("day-unknown")
+                && undated.contains("0+")
+        );
+        assert!(!undated.contains("day-new") && !undated.contains("day-old"));
+        let missing = text(
+            DetailScope::Day(day + chrono::Duration::days(10)),
+            false,
+            LayoutMode::Wide,
+            100,
+        );
+        assert!(missing.contains("No usage records"));
+        assert!(!missing.contains("day-new"));
     }
 }

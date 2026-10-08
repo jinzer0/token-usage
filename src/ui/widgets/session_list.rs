@@ -21,10 +21,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
             let client = match session.key.client {
                 Client::Codex => "C",
                 Client::Gjc => "G",
+                Client::OpenCode => "O",
             };
             let client_style = match session.key.client {
                 Client::Codex => theme.client_codex(),
                 Client::Gjc => theme.client_gjc(),
+                Client::OpenCode => theme.client_opencode(),
             };
             let total = format::token_count(session.tokens.total_tokens);
             let prefix_width = 6usize;

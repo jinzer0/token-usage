@@ -30,6 +30,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
         .iter()
         .filter(|s| s.key.client == Client::Gjc)
         .count();
+    let opencode = app
+        .snapshot
+        .sessions
+        .iter()
+        .filter(|s| s.key.client == Client::OpenCode)
+        .count();
     let refreshed = app
         .snapshot
         .generated_at
@@ -63,7 +69,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
     if area.width >= 110 {
         spans.push(Span::raw("     "));
         spans.push(Span::styled(
-            format!("codex {codex} · gjc {gjc}"),
+            format!("codex {codex} · gjc {gjc} · opencode {opencode}"),
             theme.muted_text(),
         ));
     }
