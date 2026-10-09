@@ -2,7 +2,7 @@ use crate::{
     aggregate::{ModelStats, SessionStats},
     domain::{Client, ReasoningEffort, TokenStats},
     ui::{
-        app::{App, DetailScope},
+        app::{App, DetailScope, PaneFocus},
         format,
         layout::LayoutMode,
         theme::Theme,
@@ -12,7 +12,7 @@ use ratatui::{
     Frame,
     layout::Rect,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, mode: LayoutMode) {
@@ -64,70 +64,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, mode:
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(theme.border())
+                .border_style(if app.focus == PaneFocus::Details {
+                    theme.title()
+                } else {
+                    theme.border()
+                })
                 .title(title),
         );
     frame.render_widget(paragraph, area);
-    render_date_picker(frame, area, app, theme);
-}
-
-pub(super) fn picker_available(area: Rect) -> bool {
-    area.width >= 16 && area.height >= 3
-}
-
-fn render_date_picker(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
-    let Some(picker) = &app.date_picker else {
-        return;
-    };
-    if !picker_available(area) {
-        return;
-    }
-    let width = area.width.min(44);
-    let height = area.height.min(12).min(
-        picker
-            .options
-            .len()
-            .saturating_add(2)
-            .min(u16::MAX as usize) as u16,
-    );
-    let popup = Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
-        width,
-        height,
-    );
-    let rows = height.saturating_sub(2) as usize;
-    let start = picker
-        .cursor
-        .saturating_sub(rows / 2)
-        .min(picker.options.len().saturating_sub(rows));
-    let lines = picker
-        .options
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(rows)
-        .map(|(index, scope)| {
-            let style = if index == picker.cursor {
-                theme
-                    .primary_text()
-                    .add_modifier(ratatui::style::Modifier::REVERSED)
-            } else {
-                theme.primary_text()
-            };
-            Line::styled(scope.label(), style)
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(theme.border())
-                .title("Usage date"),
-        ),
-        popup,
-    );
 }
 
 fn detail_lines(
@@ -179,6 +123,13 @@ fn detail_lines(
         ),
     ]));
     lines.push(Line::styled(scope.label(), theme.muted_text()));
+    lines.push(Line::styled(
+        format!("Total {}", tokens.total_tokens),
+        theme.number(),
+    ));
+    if breakdown {
+        push_exact_components(&mut lines, tokens, theme);
+    }
     lines.push(Line::raw(""));
 
     for (idx, model) in models.iter().enumerate() {
@@ -283,6 +234,51 @@ fn push_model(
             );
         }
     }
+    if breakdown {
+        lines.push(Line::styled(
+            format!("Model exact total {}", model.tokens.total_tokens),
+            theme.number(),
+        ));
+        push_exact_components(lines, &model.tokens, theme);
+        for effort in &model.efforts {
+            lines.push(Line::styled(
+                format!(
+                    "Effort {} exact total {}",
+                    effort_label(&effort.effort),
+                    effort.tokens.total_tokens
+                ),
+                theme.number(),
+            ));
+            push_exact_components(lines, &effort.tokens, theme);
+        }
+    }
+}
+
+fn push_exact_components(lines: &mut Vec<Line<'static>>, tokens: &TokenStats, theme: &Theme) {
+    for (label, value) in [
+        ("INPUT", tokens.input_total),
+        ("Uncached", tokens.input_uncached),
+        ("Cache read", tokens.cache_read),
+        ("Cache write", tokens.cache_write),
+        ("OUTPUT", tokens.output_total),
+    ] {
+        lines.push(Line::styled(
+            format!("{label} {value}"),
+            theme.primary_text(),
+        ));
+    }
+    lines.push(Line::styled(
+        format!(
+            "REASONING {}{}",
+            tokens.reasoning_known,
+            if tokens.reasoning_has_unknown {
+                "+ (some unknown)"
+            } else {
+                ""
+            }
+        ),
+        theme.reasoning(),
+    ));
 }
 
 fn push_effort(
@@ -365,6 +361,7 @@ mod tests {
             parent: None,
             name: Some("session".into()),
             started_at: None,
+            last_used_at: None,
             tokens: TokenStats {
                 total_tokens: 100,
                 ..Default::default()

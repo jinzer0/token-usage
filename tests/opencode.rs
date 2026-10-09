@@ -99,7 +99,7 @@ fn fixture_normalizes_components_and_roots_without_counting_parts_or_summaries()
     assert!(!first.tokens.reasoning_has_unknown);
     assert_eq!(first.tokens.total_tokens, 170);
     assert_eq!(first.started_at, Some(Utc.timestamp_millis_opt(0).unwrap()));
-    let snapshot = aggregate(vec![result]);
+    let snapshot = aggregate(vec![result]).unwrap();
     assert_eq!(snapshot.sessions.len(), 1);
     let root = resolve_session(&snapshot, "opencode:abc").unwrap();
     assert_eq!(root.record_count, 4);
@@ -141,7 +141,8 @@ fn source_neutral_aggregation_keeps_equal_session_ids_separate() {
         sources::opencode::parse(&path).unwrap(),
         sources::codex::parse(Path::new("tests/fixtures/codex")).unwrap(),
         sources::gjc::parse(Path::new("tests/fixtures/gjc")).unwrap(),
-    ]);
+    ])
+    .unwrap();
     assert_eq!(
         resolve_session(&snapshot, "opencode:abc")
             .unwrap()
@@ -175,7 +176,7 @@ fn provider_and_model_identity_escape_separator_and_percent_without_collisions()
         data["modelID"] = json!(model);
         message(&db, id, "s", data);
     }
-    let snapshot = aggregate(vec![sources::opencode::parse(&path).unwrap()]);
+    let snapshot = aggregate(vec![sources::opencode::parse(&path).unwrap()]).unwrap();
     let mut models = snapshot.sessions[0]
         .models
         .iter()
@@ -348,7 +349,7 @@ fn timestamps_missing_or_invalid_remain_unknown_then_use_common_filter() {
     assert!(parsed.diagnostics.len() >= 4);
     assert_diagnostic_paths(&parsed, &path);
     assert_eq!(
-        aggregate(vec![parsed.clone()]).sessions[0]
+        aggregate(vec![parsed.clone()]).unwrap().sessions[0]
             .tokens
             .total_tokens,
         84
@@ -495,7 +496,7 @@ fn deep_chains_orphans_and_cycles_have_deterministic_roots() {
         assert_eq!(record.session_key.id.0, expected);
     }
     assert_diagnostic_paths(&result, &path);
-    assert_eq!(aggregate(vec![result]).sessions.len(), 6);
+    assert_eq!(aggregate(vec![result]).unwrap().sessions.len(), 6);
 }
 
 #[test]
@@ -566,7 +567,12 @@ fn parsing_is_read_only_and_refresh_replaces_updated_message_usage() {
     let second = sources::opencode::parse(&path).unwrap();
     assert_eq!(second.records.len(), 1);
     assert_eq!(second.records[0].tokens.total_tokens, 111);
-    assert_eq!(aggregate(vec![second]).sessions[0].tokens.total_tokens, 111);
+    assert_eq!(
+        aggregate(vec![second]).unwrap().sessions[0]
+            .tokens
+            .total_tokens,
+        111
+    );
     assert_eq!(fs::read(&path).unwrap(), updated_bytes);
 }
 
@@ -592,7 +598,12 @@ fn live_wal_reader_sees_committed_usage_but_not_uncommitted_writes() {
     db.execute_batch("COMMIT;").unwrap();
     let second = sources::opencode::parse(&path).unwrap();
     assert_eq!(second.records.len(), 2);
-    assert_eq!(aggregate(vec![second]).sessions[0].tokens.total_tokens, 42);
+    assert_eq!(
+        aggregate(vec![second]).unwrap().sessions[0]
+            .tokens
+            .total_tokens,
+        42
+    );
 }
 
 #[test]
@@ -803,7 +814,7 @@ fn missing_own_session_keeps_original_identity_and_diagnoses_once_per_session() 
             .all(|d| d.code == "OpenCodeMissingSession")
     );
     assert_diagnostic_paths(&parsed, &path);
-    let snapshot = aggregate(vec![parsed]);
+    let snapshot = aggregate(vec![parsed]).unwrap();
     assert_eq!(snapshot.sessions.len(), 3);
     let absent = resolve_session(&snapshot, "opencode:absent").unwrap();
     assert_eq!(absent.record_count, 2);
