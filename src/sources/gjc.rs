@@ -1,6 +1,6 @@
 use crate::{
     diagnostics::Diagnostic,
-    domain::{Client, MessageId, ReasoningEffort, SessionId, SessionKey, UsageRecord},
+    domain::{Client, MessageId, ReasoningEffort, SessionId, SessionKey, TokenStats, UsageRecord},
     scan::{ParseResult, ScanSummary},
     sources::codex::{string_at, token_stats, u64_at},
 };
@@ -177,7 +177,21 @@ fn parse_file(
             ));
             continue;
         }
-        let tokens = token_stats(usage);
+        let tokens = match normalize_usage(usage) {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                summary.records_skipped += 1;
+                diagnostics.push(Diagnostic::error(
+                    Client::Gjc,
+                    "GjcTokenOverflow",
+                    error.to_string(),
+                    Some(path.to_path_buf()),
+                    Some(line_no),
+                ));
+                continue;
+            }
+        };
+        // normalize_usage validates this sum before returning a record.
         let component_total = tokens.input_total + tokens.output_total;
         if tokens.total_tokens != 0
             && component_total != 0
@@ -234,6 +248,26 @@ fn parse_file(
     Ok(())
 }
 
+fn normalize_usage(usage: &Value) -> Result<TokenStats> {
+    let mut tokens = token_stats(usage)?;
+    // GJC's native `input` is uncached; cacheRead/cacheWrite are separate buckets.
+    if let Some(input) = usage.get("input").and_then(Value::as_u64) {
+        tokens.input_uncached = input;
+        tokens.input_total = input
+            .checked_add(tokens.cache_read)
+            .and_then(|total| total.checked_add(tokens.cache_write))
+            .context("token normalization overflow in input + cache_read + cache_write")?;
+        let component_total = tokens
+            .input_total
+            .checked_add(tokens.output_total)
+            .context("token normalization overflow in input_total + output_total")?;
+        if u64_at(usage, &["total_tokens", "totalTokens", "total"]).is_none() {
+            tokens.total_tokens = component_total;
+        }
+    }
+    Ok(tokens)
+}
+
 fn resolve_effort(
     branch: Option<&str>,
     efforts: &HashMap<String, Option<ReasoningEffort>>,
@@ -251,5 +285,48 @@ fn resolve_effort(
         if guard > 32 {
             return None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn native_input_and_cache_are_disjoint_and_output_does_not_double_count_reasoning() {
+        let tokens = normalize_usage(&json!({
+            "input": 535, "output": 149, "cacheRead": 22784,
+            "cacheWrite": 3, "totalTokens": 23471, "reasoningTokens": 20
+        }))
+        .unwrap();
+        assert_eq!(tokens.input_uncached, 535);
+        assert_eq!(tokens.input_total, 23322);
+        assert_eq!(tokens.output_total, 149);
+        assert_eq!(tokens.total_tokens, 23471);
+        assert_eq!(tokens.reasoning_known, 20);
+    }
+
+    #[test]
+    fn native_cache_overflow_is_rejected_and_explicit_total_is_preserved() {
+        assert!(
+            normalize_usage(&json!({
+                "input": u64::MAX, "cacheRead": 1, "totalTokens": 1
+            }))
+            .is_err()
+        );
+        let tokens = normalize_usage(&json!({
+            "input": 3, "cacheRead": 5, "cacheWrite": 2,
+            "output": 4, "totalTokens": 17
+        }))
+        .unwrap();
+        assert_eq!(tokens.input_total, 10);
+        assert_eq!(tokens.total_tokens, 17);
+        assert!(tokens.reasoning_has_unknown);
+        let tokens = normalize_usage(&json!({
+            "input": 3, "cacheRead": 5, "cacheWrite": 2, "output": 4
+        }))
+        .unwrap();
+        assert_eq!(tokens.total_tokens, 14);
     }
 }

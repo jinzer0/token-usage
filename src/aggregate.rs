@@ -1,13 +1,15 @@
 use crate::{
-    diagnostics::Diagnostic,
-    domain::{ReasoningEffort, SessionKey, TokenStats, UsageRecord},
+    diagnostics::{Diagnostic, Severity},
+    domain::{ReasoningEffort, SessionKey, TokenStats},
     scan::{ParseResult, SourceCounts},
     time::{GroupBy, TimeMatch, TimeSelection, bucket_start},
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
 use serde::Serialize;
 use std::collections::BTreeMap;
+
+mod tokscale;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct EffortStats {
@@ -30,6 +32,7 @@ pub struct SessionStats {
     pub parent: Option<SessionKey>,
     pub name: Option<String>,
     pub started_at: Option<DateTime<Utc>>,
+    pub last_used_at: Option<DateTime<Utc>>,
     pub tokens: TokenStats,
     pub models: Vec<ModelStats>,
     pub record_count: u64,
@@ -48,11 +51,28 @@ pub struct SessionDayStats {
 #[derive(Clone, Debug, Serialize)]
 pub struct AggregateSnapshot {
     pub generated_at: DateTime<Utc>,
+    pub totals: TokenStats,
     pub sessions: Vec<SessionStats>,
+    #[serde(skip_serializing)]
+    pub dates: Vec<DateStats>,
     pub timeline: Vec<TimeBucket>,
     pub periods: PeriodUsage,
     pub diagnostics: Vec<Diagnostic>,
     pub source_counts: SourceCounts,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionDayRef {
+    pub session_index: usize,
+    pub day_index: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct DateStats {
+    pub day: Option<NaiveDate>,
+    pub tokens: TokenStats,
+    pub record_count: u64,
+    pub sessions: Vec<SessionDayRef>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -86,9 +106,8 @@ pub enum SelectorError {
     },
 }
 
-pub fn aggregate(results: Vec<ParseResult>) -> AggregateSnapshot {
+pub fn aggregate(results: Vec<ParseResult>) -> Result<AggregateSnapshot> {
     aggregate_with_options(results, &AggregateOptions::default())
-        .expect("default aggregation cannot fail")
 }
 
 pub fn aggregate_with_options(
@@ -97,27 +116,38 @@ pub fn aggregate_with_options(
 ) -> Result<AggregateSnapshot> {
     let mut source_counts = SourceCounts::default();
     let mut diagnostics = Vec::new();
-    let mut by_session: BTreeMap<SessionKey, Vec<UsageRecord>> = BTreeMap::new();
+    let mut by_session: BTreeMap<SessionKey, tokscale::SessionAccumulator> = BTreeMap::new();
     let mut timeline: BTreeMap<DateTime<Utc>, TimeBucket> = BTreeMap::new();
     let mut periods = PeriodUsage::default();
     let now = Local::now();
     let today_start = crate::time::build_selection(true, None, None, now)?.since;
-    let seven_days_start = (now - Duration::days(7)).with_timezone(&Utc);
-    let thirty_days_start = (now - Duration::days(30)).with_timezone(&Utc);
+    let seven_days_start = now
+        .checked_sub_signed(Duration::days(7))
+        .context("seven-day period start overflow")?
+        .with_timezone(&Utc);
+    let thirty_days_start = now
+        .checked_sub_signed(Duration::days(30))
+        .context("thirty-day period start overflow")?
+        .with_timezone(&Utc);
 
     for result in results {
-        source_counts.merge_summary(&result.summary);
-        source_counts.merge_diagnostics(&result.diagnostics);
+        merge_source_counts(&mut source_counts, &result)?;
         diagnostics.extend(result.diagnostics);
         for record in result.records {
+            let session = by_session.entry(record.session_key.clone()).or_default();
+            session.observe_timestamp(record.started_at);
             match options.time_selection.contains(record.started_at) {
                 TimeMatch::Included => {}
                 TimeMatch::MissingTimestamp => {
-                    source_counts.records_missing_timestamp_filtered += 1;
+                    checked_count(
+                        &mut source_counts.records_missing_timestamp_filtered,
+                        1,
+                        "missing timestamp filtered",
+                    )?;
                     continue;
                 }
                 TimeMatch::OutsideRange => {
-                    source_counts.records_time_filtered += 1;
+                    checked_count(&mut source_counts.records_time_filtered, 1, "time filtered")?;
                     continue;
                 }
             }
@@ -130,32 +160,48 @@ pub fn aggregate_with_options(
                     tokens: TokenStats::default(),
                     record_count: 0,
                 });
-                bucket.tokens.add_assign(&record.tokens);
-                bucket.record_count += 1;
+                bucket
+                    .tokens
+                    .checked_add_assign(&record.tokens)
+                    .context("timeline bucket")?;
+                checked_count(&mut bucket.record_count, 1, "timeline records")?;
             } else if options.group_by.is_some() {
-                source_counts.records_missing_timestamp_filtered += 1;
+                checked_count(
+                    &mut source_counts.records_missing_timestamp_filtered,
+                    1,
+                    "missing timestamp filtered",
+                )?;
             }
             if let Some(started_at) = record.started_at {
                 if today_start.is_some_and(|start| started_at >= start) {
-                    periods.today.add_assign(&record.tokens);
+                    periods
+                        .today
+                        .checked_add_assign(&record.tokens)
+                        .context("today period")?;
                 }
                 if started_at >= seven_days_start {
-                    periods.seven_days.add_assign(&record.tokens);
+                    periods
+                        .seven_days
+                        .checked_add_assign(&record.tokens)
+                        .context("seven-day period")?;
                 }
                 if started_at >= thirty_days_start {
-                    periods.thirty_days.add_assign(&record.tokens);
+                    periods
+                        .thirty_days
+                        .checked_add_assign(&record.tokens)
+                        .context("thirty-day period")?;
                 }
             }
-            by_session
-                .entry(record.session_key.clone())
-                .or_default()
-                .push(record);
+            session.add_message(&record)?;
         }
     }
 
     let mut sessions = by_session
         .into_iter()
-        .map(|(key, records)| build_session(key, records))
+        .map(|(key, accumulator)| accumulator.finish(key))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
         .collect::<Vec<_>>();
     sessions.sort_by(|a, b| {
         b.tokens
@@ -164,9 +210,38 @@ pub fn aggregate_with_options(
             .then_with(|| a.key.qualified().cmp(&b.key.qualified()))
     });
 
+    let mut totals = TokenStats::default();
+    let mut dates: BTreeMap<Option<NaiveDate>, DateStats> = BTreeMap::new();
+    for (session_index, session) in sessions.iter().enumerate() {
+        totals
+            .checked_add_assign(&session.tokens)
+            .context("snapshot totals")?;
+        for (day_index, day) in session.daily.iter().enumerate() {
+            let date = dates.entry(day.day).or_insert_with(|| DateStats {
+                day: day.day,
+                tokens: TokenStats::default(),
+                record_count: 0,
+                sessions: Vec::new(),
+            });
+            date.tokens
+                .checked_add_assign(&day.tokens)
+                .context("global date totals")?;
+            checked_count(
+                &mut date.record_count,
+                day.record_count,
+                "global date records",
+            )?;
+            date.sessions.push(SessionDayRef {
+                session_index,
+                day_index,
+            });
+        }
+    }
     Ok(AggregateSnapshot {
         generated_at: Utc::now(),
+        totals,
         sessions,
+        dates: dates.into_values().rev().collect(),
         timeline: timeline.into_values().collect(),
         periods,
         diagnostics,
@@ -174,117 +249,51 @@ pub fn aggregate_with_options(
     })
 }
 
-fn build_session(key: SessionKey, records: Vec<UsageRecord>) -> SessionStats {
-    let mut all = UsageAccumulator::default();
-    let mut days: BTreeMap<Option<NaiveDate>, UsageAccumulator> = BTreeMap::new();
-    let mut parent = None;
-    let mut name = None;
-    let mut started_at: Option<DateTime<Utc>> = None;
-
-    for record in records {
-        all.add_record(&record);
-        let day = record
-            .started_at
-            .map(|t| t.with_timezone(&Local).date_naive());
-        days.entry(day).or_default().add_record(&record);
-        parent = parent.or_else(|| record.parent_session_key.clone());
-        name = name.or_else(|| record.session_name.clone());
-        started_at = match (started_at, record.started_at) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (None, b) => b,
-            (a, None) => a,
-        };
-    }
-
-    let (tokens, models, record_count) = all.finish();
-    let daily = days
-        .into_iter()
-        .rev()
-        .map(|(day, usage)| {
-            let (tokens, models, record_count) = usage.finish();
-            SessionDayStats {
-                day,
-                tokens,
-                models,
-                record_count,
-            }
-        })
-        .collect();
-    SessionStats {
-        key,
-        parent,
-        name,
-        started_at,
-        tokens,
-        models,
-        record_count,
-        daily,
-    }
+fn checked_count(sum: &mut u64, value: u64, field: &str) -> Result<()> {
+    *sum = sum
+        .checked_add(value)
+        .ok_or_else(|| anyhow::anyhow!("count overflow in {field}: {sum} + {value}"))?;
+    Ok(())
 }
 
-#[derive(Default)]
-struct UsageAccumulator {
-    tokens: TokenStats,
-    record_count: u64,
-    models: BTreeMap<String, BTreeMap<Option<ReasoningEffort>, (TokenStats, u64)>>,
-}
-
-impl UsageAccumulator {
-    fn add_record(&mut self, record: &UsageRecord) {
-        self.tokens.add_assign(&record.tokens);
-        self.record_count += 1;
-        let (tokens, count) = self
-            .models
-            .entry(record.model.clone())
-            .or_default()
-            .entry(record.reasoning_effort.clone())
-            .or_default();
-        tokens.add_assign(&record.tokens);
-        *count += 1;
+fn merge_source_counts(counts: &mut SourceCounts, result: &ParseResult) -> Result<()> {
+    let summary = &result.summary;
+    counts.roots_scanned.extend(summary.roots_scanned.clone());
+    counts.missing_roots.extend(summary.missing_roots.clone());
+    counts.empty_roots.extend(summary.empty_roots.clone());
+    checked_count(
+        &mut counts.files_scanned,
+        summary.files_scanned,
+        "files_scanned",
+    )?;
+    checked_count(&mut counts.lines_read, summary.lines_read, "lines_read")?;
+    checked_count(
+        &mut counts.records_emitted,
+        summary.records_emitted,
+        "records_emitted",
+    )?;
+    checked_count(
+        &mut counts.records_skipped,
+        summary.records_skipped,
+        "records_skipped",
+    )?;
+    checked_count(
+        &mut counts.records_time_filtered,
+        summary.records_time_filtered,
+        "records_time_filtered",
+    )?;
+    checked_count(
+        &mut counts.records_missing_timestamp_filtered,
+        summary.records_missing_timestamp_filtered,
+        "records_missing_timestamp_filtered",
+    )?;
+    for diagnostic in &result.diagnostics {
+        match diagnostic.severity {
+            Severity::Warning => checked_count(&mut counts.warnings, 1, "warnings")?,
+            Severity::Error => checked_count(&mut counts.errors, 1, "errors")?,
+        }
     }
-
-    fn finish(self) -> (TokenStats, Vec<ModelStats>, u64) {
-        let mut models = self
-            .models
-            .into_iter()
-            .map(|(model, efforts_map)| {
-                let mut model_tokens = TokenStats::default();
-                let mut model_count = 0;
-                let mut efforts = efforts_map
-                    .into_iter()
-                    .map(|(effort, (effort_tokens, count))| {
-                        model_tokens.add_assign(&effort_tokens);
-                        model_count += count;
-                        EffortStats {
-                            effort,
-                            tokens: effort_tokens,
-                            record_count: count,
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                efforts.sort_by(|a, b| {
-                    b.tokens
-                        .total_tokens
-                        .cmp(&a.tokens.total_tokens)
-                        .then_with(|| effort_label(&a.effort).cmp(&effort_label(&b.effort)))
-                });
-                ModelStats {
-                    model,
-                    tokens: model_tokens,
-                    efforts,
-                    record_count: model_count,
-                }
-            })
-            .collect::<Vec<_>>();
-        models.sort_by(|a, b| {
-            b.tokens
-                .total_tokens
-                .cmp(&a.tokens.total_tokens)
-                .then_with(|| a.model.cmp(&b.model))
-        });
-
-        (self.tokens, models, self.record_count)
-    }
+    Ok(())
 }
 
 fn effort_label(effort: &Option<ReasoningEffort>) -> String {
@@ -330,7 +339,185 @@ pub fn resolve_session<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Client, SessionId};
+    use crate::domain::{Client, SessionId, UsageRecord};
+
+    fn fixture_record(
+        client: Client,
+        id: &str,
+        at: Option<DateTime<Utc>>,
+        tokens: TokenStats,
+    ) -> UsageRecord {
+        UsageRecord {
+            session_key: SessionKey {
+                client,
+                id: SessionId(id.into()),
+            },
+            parent_session_key: None,
+            message_id: None,
+            source_path: "fixture".into(),
+            source_line: None,
+            started_at: at,
+            session_name: None,
+            model: "raw-model".into(),
+            reasoning_effort: None,
+            tokens,
+        }
+    }
+
+    fn fixture(records: Vec<UsageRecord>) -> ParseResult {
+        let mut result = ParseResult::empty(Client::Gjc, "fixture".into());
+        result.records = records;
+        result
+    }
+
+    fn field_tokens(field: usize, value: u64) -> TokenStats {
+        let mut tokens = TokenStats::default();
+        let fields = [
+            &mut tokens.input_uncached,
+            &mut tokens.input_total,
+            &mut tokens.cache_read,
+            &mut tokens.cache_write,
+            &mut tokens.output_total,
+            &mut tokens.reasoning_known,
+            &mut tokens.total_tokens,
+        ];
+        *fields.into_iter().nth(field).unwrap() = value;
+        tokens
+    }
+
+    #[test]
+    fn all_clients_accept_max_and_reject_max_plus_one_in_every_field() {
+        for client in [Client::Codex, Client::Gjc, Client::OpenCode] {
+            for field in 0..7 {
+                let mut records = vec![
+                    fixture_record(client, "one", None, field_tokens(field, u64::MAX - 1)),
+                    fixture_record(client, "two", None, field_tokens(field, 1)),
+                ];
+                assert!(aggregate(vec![fixture(records.clone())]).is_ok());
+                records.push(fixture_record(
+                    client,
+                    "three",
+                    None,
+                    field_tokens(field, 1),
+                ));
+                assert!(aggregate(vec![fixture(records)]).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn recency_is_pre_filter_but_usage_and_start_are_filtered() {
+        let early: DateTime<Utc> = "2026-03-10T12:00:00.123456789Z".parse().unwrap();
+        let late = early + Duration::days(2);
+        let tokens = TokenStats {
+            total_tokens: 7,
+            ..Default::default()
+        };
+        let result = fixture(vec![
+            fixture_record(Client::Gjc, "kept", Some(early), tokens.clone()),
+            fixture_record(Client::Gjc, "kept", Some(late), field_tokens(6, u64::MAX)),
+            fixture_record(Client::Gjc, "removed", Some(late), tokens),
+            fixture_record(Client::Gjc, "kept", None, field_tokens(6, 1)),
+        ]);
+        let snapshot = aggregate_with_options(
+            vec![result],
+            &AggregateOptions {
+                time_selection: TimeSelection {
+                    since: Some(early),
+                    until: Some(early + Duration::seconds(1)),
+                },
+                group_by: Some(GroupBy::Day),
+            },
+        )
+        .unwrap();
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert_eq!(snapshot.sessions[0].started_at, Some(early));
+        assert_eq!(snapshot.sessions[0].last_used_at, Some(late));
+        assert_eq!(snapshot.totals.total_tokens, 7);
+        assert_eq!(snapshot.timeline[0].tokens.total_tokens, 7);
+        assert_eq!(snapshot.source_counts.records_time_filtered, 2);
+        assert_eq!(snapshot.source_counts.records_missing_timestamp_filtered, 1);
+    }
+
+    #[test]
+    fn global_dates_reference_sorted_sessions_and_conserve_unknown_and_zero_records() {
+        let at: DateTime<Utc> = "2026-03-10T12:00:00Z".parse().unwrap();
+        let snapshot = aggregate(vec![fixture(vec![
+            fixture_record(Client::Gjc, "low", Some(at), field_tokens(6, 3)),
+            fixture_record(Client::Codex, "high", Some(at), field_tokens(6, 9)),
+            fixture_record(
+                Client::Gjc,
+                "low",
+                None,
+                TokenStats {
+                    reasoning_has_unknown: true,
+                    ..Default::default()
+                },
+            ),
+            fixture_record(Client::OpenCode, "zero", None, TokenStats::default()),
+        ])])
+        .unwrap();
+        assert_eq!(snapshot.sessions[0].key.id.0, "high");
+        assert_eq!(snapshot.dates.len(), 2);
+        assert_eq!(
+            snapshot.dates[0].day,
+            Some(at.with_timezone(&Local).date_naive())
+        );
+        assert_eq!(snapshot.dates[1].day, None);
+        assert_eq!(snapshot.dates[1].record_count, 2);
+        assert!(snapshot.dates[1].tokens.reasoning_has_unknown);
+        let mut total = TokenStats::default();
+        for date in &snapshot.dates {
+            total.checked_add_assign(&date.tokens).unwrap();
+            let mut day_total = TokenStats::default();
+            let mut count = 0;
+            for reference in &date.sessions {
+                let day = &snapshot.sessions[reference.session_index].daily[reference.day_index];
+                assert_eq!(day.day, date.day);
+                day_total.checked_add_assign(&day.tokens).unwrap();
+                count += day.record_count;
+            }
+            assert_eq!(day_total, date.tokens);
+            assert_eq!(count, date.record_count);
+        }
+        assert_eq!(total, snapshot.totals);
+        assert_eq!(total.total_tokens, 12);
+        assert!(total.reasoning_has_unknown);
+    }
+
+    #[test]
+    fn summary_and_count_overflows_are_errors() {
+        let mut first = fixture(Vec::new());
+        first.summary.records_emitted = u64::MAX;
+        let mut second = fixture(Vec::new());
+        second.summary.records_emitted = 1;
+        assert!(aggregate(vec![first, second]).is_err());
+        let mut count = u64::MAX;
+        assert!(checked_count(&mut count, 1, "test records").is_err());
+        assert_eq!(count, u64::MAX);
+    }
+
+    #[test]
+    fn timeline_and_period_overflows_propagate_context() {
+        let at = Utc::now() + Duration::seconds(1);
+        let records = vec![
+            fixture_record(Client::Codex, "one", Some(at), field_tokens(6, u64::MAX)),
+            fixture_record(Client::Gjc, "two", Some(at), field_tokens(6, 1)),
+        ];
+        let timeline_error = aggregate_with_options(
+            vec![fixture(records.clone())],
+            &AggregateOptions {
+                group_by: Some(GroupBy::Day),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(timeline_error.to_string(), "timeline bucket");
+        assert!(format!("{timeline_error:#}").contains("total_tokens"));
+        let period_error = aggregate(vec![fixture(records)]).unwrap_err();
+        assert_eq!(period_error.to_string(), "today period");
+        assert!(format!("{period_error:#}").contains("total_tokens"));
+    }
 
     #[test]
     fn daily_keeps_local_dates_midnight_and_dst() {
@@ -413,7 +600,7 @@ mod tests {
                 },
             });
         }
-        let snapshot = aggregate(vec![result]);
+        let snapshot = aggregate(vec![result]).unwrap();
         let session = &snapshot.sessions[0];
         assert_eq!(session.daily.len(), expected.len(), "zone {zone}");
         for bucket in &session.daily {

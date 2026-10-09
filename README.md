@@ -32,8 +32,8 @@ token-usage --version
 예:
 
 ```bash
-curl -LO https://github.com/jinzer0/token-usage/releases/download/v0.3.0/token-usage-v0.3.0-aarch64-apple-darwin.tar.gz
-tar -xzf token-usage-v0.3.0-aarch64-apple-darwin.tar.gz
+curl -LO https://github.com/jinzer0/token-usage/releases/download/v0.4.0/token-usage-v0.4.0-aarch64-apple-darwin.tar.gz
+tar -xzf token-usage-v0.4.0-aarch64-apple-darwin.tar.gz
 mkdir -p ~/.local/bin
 mv token-usage ~/.local/bin/
 token-usage --version
@@ -221,7 +221,7 @@ token-usage --tui
 client session total input output reasoning
 ```
 
-- `client`: `codex` 또는 `gjc`
+- `client`: `codex`, `gjc` 또는 `opencode`
 - `session`: 세션 이름이 있으면 이름, 없으면 세션 id
 - `total`: 총 토큰 수
 - `input`: 입력 토큰 수
@@ -253,13 +253,18 @@ date         total       input       output      reasoning   records
 `--json` 출력의 최상위 구조는 다음 필드를 포함합니다.
 
 - `generated_at`: 집계 생성 시각
+- `totals`: 현재 필터 범위 전체의 정확한 토큰 합계
 - `sessions`: 세션별 집계 목록
 - `timeline`: `--group-by` 사용 시 기간 bucket 목록
 - `periods`: TUI/요약용 today, 7 days, 30 days token totals
 - `diagnostics`: 파싱 중 발생한 경고/오류
 - `source_counts`: 스캔 파일 수, 읽은 줄 수, emit/skip/filter record 수, missing/empty root 등
 
-`sessions`는 총 토큰 수 내림차순으로 정렬됩니다.
+`sessions`는 총 토큰 수 내림차순으로 정렬됩니다. 각 세션의 `last_used_at`는 기간 필터 적용 전 유효한 사용 기록의 마지막 시각이며, 시각이 없으면 `null`입니다. 날짜별 인덱스는 TUI 내부 데이터로 JSON에 중복 저장하지 않습니다.
+
+집계는 tokscale의 날짜·세션 accumulator 구조를 기반으로 이식했습니다. 참조 revision은 `d4d1c751856e25913bce97bfbd7b254308863239`이며 출처와 MIT 전문은 `THIRD_PARTY_NOTICES`에 있습니다. 원형의 signed/포화 합산 대신 명시적 `u64` 합계와 checked 오류 처리를 사용하고, 모델·추론 강도·캐시·추론 미상 정보를 보존합니다. 합계 overflow는 어느 소스를 선택하든 오류로 보고하며 부분 snapshot을 출력하지 않습니다.
+
+Codex의 `session_meta`/`turn_context`/`event_msg.token_count` 원시 로그를 읽고, 같은 누적 사용량이 반복되는 알림은 다시 더하지 않습니다. GJC의 원시 `input`은 캐시와 별개이므로 입력 총량에는 `cacheRead`와 `cacheWrite`를 포함합니다. 추론 토큰을 출력에 다시 더하지 않으며 명시된 총량은 별도로 보존합니다.
 
 ## TUI
 
@@ -267,24 +272,33 @@ date         total       input       output      reasoning   records
 token-usage --tui
 ```
 
-상단 헤더에는 전체 세션 수와 토큰 수, 오늘/7일/30일 사용량 요약, 새로고침 시간이 표시됩니다.
+두 탭으로 구분합니다. `1 Sessions`는 세션별 전체 사용량과 모델·추론 상세, `2 Dates`는 왼쪽 날짜별 합계, 가운데 선택 날짜의 세션, 오른쪽 해당 세션의 당일 상세를 표시합니다. 날짜는 모달 없이 즉시 전환됩니다.
+
+Dates 탭은 최소 **110열 × 12행**을 요구합니다. 그보다 작으면 확대 안내를 표시하고 선택은 그대로 보존합니다. 정상 크기로 돌아오면 같은 날짜와 세션을 조회할 수 있습니다.
 
 주요 키:
 
 ```text
-j/k 또는 ↑/↓   세션 이동
+1 / 2          Sessions / Dates 탭
+Tab/Shift-Tab   패널 이동 (←/→도 가능)
+j/k 또는 ↑/↓   현재 패널의 날짜·세션 이동
+[ / ]          Dates 탭에서 이전·다음 날짜
 J/K            상세 패널 스크롤
 /              세션 검색
 v              상세 breakdown 토글
-d              선택 세션의 사용 날짜 선택
+d              선택 세션을 고정해 Dates 탭 열기
+p              날짜 탐색의 세션 고정 켜기·끄기
+s              최신순 / 토큰 사용량순 전환
 r              새로고침
 ?              도움말
 q              종료
 ```
 
-상세의 기본 범위는 현재 기간 필터 안에서 선택한 세션의 `All` 누적입니다. `d`를 누르면 `All`, 사용 기록이 있는 로컬 날짜(최신순), 날짜 미상 기록이 있을 때 `Unknown date`를 선택할 수 있습니다. 토큰이 0이어도 기록이 있는 날짜는 포함하고, 기록 없는 날짜는 만들지 않습니다. 팝업에서는 ↑/↓로 이동하고 Enter로 적용하거나 Esc로 취소합니다. 모델·추론 강도·`v` 세부 토큰과 비율은 선택한 범위를 기준으로 표시합니다. 날짜 범위는 TUI 전용이며 JSON 출력은 바뀌지 않습니다.
+두 탭의 기본 정렬은 세션 전체의 마지막 사용 기록 최신순입니다. 시작 시각이나 파일 수정 시각을 사용하지 않으며, 시각 미상은 마지막에 둡니다. `s`의 토큰순은 Sessions에서 현재 기간 전체, Dates에서 선택 날짜의 사용량 기준입니다. 동률은 세션 ID와 클라이언트로 안정적으로 정렬합니다. 기간 필터가 있어도 최신순의 시각은 필터 전 전체 기록 기준입니다.
 
-다른 세션으로 실제로 이동하면 `All`로 돌아갑니다. 새로고침 후 같은 세션의 날짜가 남아 있으면 선택을 유지하고, 사라지면 안내와 함께 `All`로 전환합니다. 새로고침 실패 시 기존 데이터와 범위를 유지합니다. 검색 입력 중 `d`는 검색 문자이며, 날짜 팝업이 열린 동안 새로고침·종료 등 다른 명령은 실행되지 않습니다. 화면이 너무 작아지면 팝업 선택만 취소하고 적용된 범위는 유지합니다. OpenCode 날짜는 기존 최상위 부모 귀속을 유지한 각 메시지의 사용 시각을 따릅니다.
+Dates의 여러 날짜 행에서 전체 합계를 비교할 수 있습니다. 증감은 이전 사용일 기준이며, 기록이 없는 날짜를 가짜 0일로 채우지 않습니다. 토큰이 0이어도 유효한 기록이 있는 날짜는 표시하고, 날짜 미상 기록은 `Unknown date`에서 조회합니다. `d` 또는 `p`로 세션을 고정하면 그 세션의 사용 날짜를 빠르게 넘길 수 있고, 가운데 목록은 계속 그날 전체 세션의 비교를 제공합니다. 다른 세션을 선택하면 고정을 해제합니다.
+
+검색은 세션 목록만 필터하며 날짜의 전체 합계를 바꾸지 않습니다. 새로고침과 탭 전환은 유효한 날짜·세션·정렬을 유지하고, 사라진 선택은 안내와 함께 복구합니다. 새로고침 실패 시 이전 데이터와 선택을 유지합니다. 검색 입력 중 명령 문자는 검색 내용이며 Enter로 확정하거나 Esc로 취소합니다. OpenCode 날짜는 기존 최상위 부모 귀속을 유지한 메시지 사용 시각을 따릅니다.
 
 ## 개발
 
@@ -306,12 +320,20 @@ cargo test
 - `--json`과 `--tui` 동시 사용 runtime validation
 - 잘못된 `--since`, `--group-by`, inverted range 처리
 - OpenCode SQLite 계층·모델·날짜·누락/손상·WAL 읽기·갱신 및 합계 overflow
-- 세션별 로컬 날짜·날짜 미상 분할, 선택 범위 상세와 날짜 팝업·새로고침 상태
+- 세션별 로컬 날짜·날짜 미상 분할, 날짜별 세션 참조와 합계 보존
+- 두 탭·3열 최소 크기·세션 고정·최신순/당일 토큰순·선택 유지
 
 ## Release
 
 - `.github/workflows/ci.yml`: PR/main push에서 fmt, clippy, test 실행
 - `.github/workflows/release.yml`: `v*` tag push 시 release archive와 `SHA256SUMS` 생성
+
+### 0.4.0 변경 사항
+
+- Sessions/날짜 탭과 날짜·세션·모델 상세 3열 탐색, 날짜 비교 및 세션 고정
+- 전체 마지막 사용 시각과 선택 날짜 사용량에 따른 정렬, 검색·새로고침·리사이즈 선택 유지
+- tokscale 파생 집계와 checked 산술, 모델·추론 강도별 정확한 수치 및 날짜 미상·영 토큰 보존
+- Codex 원시 payload 및 GJC 캐시 정규화 보완, 배포 archive에 MIT 제3자 고지 포함
 
 지원 archive:
 
@@ -322,7 +344,7 @@ token-usage-vX.Y.Z-x86_64-apple-darwin.tar.gz
 token-usage-vX.Y.Z-x86_64-pc-windows-msvc.zip
 ```
 
-LICENSE 파일이 없는 경우 archive에는 binary와 README만 포함됩니다.
+모든 archive에는 binary, README와 `THIRD_PARTY_NOTICES`가 포함됩니다. `LICENSE` 파일이 있으면 함께 포함됩니다.
 
 ## 제한 사항
 

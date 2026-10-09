@@ -1,6 +1,10 @@
 use crate::{
     domain::Client,
-    ui::{app::App, format, theme::Theme},
+    ui::{
+        app::{App, PaneFocus, ViewTab},
+        format,
+        theme::Theme,
+    },
 };
 use ratatui::{
     Frame,
@@ -15,7 +19,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
         .filtered_sessions
         .iter()
         .enumerate()
-        .map(|(pos, idx)| {
+        .filter_map(|(pos, idx)| {
             let session = &app.snapshot.sessions[*idx];
             let selected = app.selected_filtered_position() == Some(pos);
             let client = match session.key.client {
@@ -28,7 +32,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
                 Client::Gjc => theme.client_gjc(),
                 Client::OpenCode => theme.client_opencode(),
             };
-            let total = format::token_count(session.tokens.total_tokens);
+            let total = format::token_count(app.selected_tokens(*idx)?.total_tokens);
             let prefix_width = 6usize;
             let total_width = total.chars().count().max(4);
             let name_width = inner_width
@@ -45,7 +49,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
             } else {
                 theme.primary_text()
             };
-            ListItem::new(Line::from(vec![
+            Some(ListItem::new(Line::from(vec![
                 Span::styled(marker, style),
                 Span::raw(" ["),
                 Span::styled(client, client_style),
@@ -53,20 +57,29 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
                 Span::styled(name, style),
                 Span::raw(" ".repeat(gap)),
                 Span::styled(total, theme.number()),
-            ]))
+            ])))
         })
         .collect::<Vec<_>>();
 
     let title = if app.search.query.is_empty() {
-        "Sessions".to_string()
+        format!("Sessions · {}", app.sort.label())
     } else {
-        format!("Sessions /{}", app.search.query)
+        format!("Sessions /{} · {}", app.search.query, app.sort.label())
+    };
+    let title = if app.tab == ViewTab::Dates && app.pinned_session.is_some() {
+        format!("{title} · pinned")
+    } else {
+        title
     };
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(theme.border())
+                .border_style(if app.focus == PaneFocus::Sessions {
+                    theme.title()
+                } else {
+                    theme.border()
+                })
                 .title(title),
         )
         .highlight_style(theme.selected_row());

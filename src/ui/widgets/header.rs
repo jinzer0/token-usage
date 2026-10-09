@@ -1,6 +1,10 @@
 use crate::{
     domain::Client,
-    ui::{app::App, format, theme::Theme},
+    ui::{
+        app::{App, ViewTab},
+        format,
+        theme::Theme,
+    },
 };
 use chrono::Local;
 use ratatui::{
@@ -11,54 +15,82 @@ use ratatui::{
 };
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
-    let session_count = app.snapshot.sessions.len();
-    let total = app
-        .snapshot
-        .sessions
-        .iter()
-        .map(|s| s.tokens.total_tokens)
-        .sum::<u64>();
-    let codex = app
-        .snapshot
-        .sessions
-        .iter()
-        .filter(|s| s.key.client == Client::Codex)
-        .count();
-    let gjc = app
-        .snapshot
-        .sessions
-        .iter()
-        .filter(|s| s.key.client == Client::Gjc)
-        .count();
-    let opencode = app
-        .snapshot
-        .sessions
-        .iter()
-        .filter(|s| s.key.client == Client::OpenCode)
-        .count();
-    let refreshed = app
-        .snapshot
-        .generated_at
-        .with_timezone(&Local)
-        .format("%H:%M")
-        .to_string();
-
-    let mut spans = vec![
-        Span::styled(" token-usage", theme.title()),
-        Span::raw("     "),
+    let mut tabs = vec![
+        Span::styled(" token-usage  ", theme.title()),
         Span::styled(
-            format!(
-                "{session_count} sessions · {} tokens",
-                format::token_count(total)
-            ),
-            theme.header(),
+            "1 Sessions",
+            if app.tab == ViewTab::Sessions {
+                theme.selected_row()
+            } else {
+                theme.muted_text()
+            },
+        ),
+        Span::raw("   "),
+        Span::styled(
+            "2 Dates",
+            if app.tab == ViewTab::Dates {
+                theme.selected_row()
+            } else {
+                theme.muted_text()
+            },
         ),
     ];
-    if area.width >= 80 {
-        spans.push(Span::raw("     "));
-        spans.push(Span::styled(
+    if area.width >= 110 {
+        let count = |client| {
+            app.snapshot
+                .sessions
+                .iter()
+                .filter(|session| session.key.client == client)
+                .count()
+        };
+        tabs.push(Span::styled(
             format!(
-                "today {} · 7d {} · 30d {}",
+                "   codex {} · gjc {} · opencode {}",
+                count(Client::Codex),
+                count(Client::Gjc),
+                count(Client::OpenCode)
+            ),
+            theme.muted_text(),
+        ));
+    }
+    if area.width >= 80 {
+        tabs.push(Span::styled(
+            format!(
+                "   refreshed {}",
+                app.snapshot
+                    .generated_at
+                    .with_timezone(&Local)
+                    .format("%H:%M")
+            ),
+            theme.muted_text(),
+        ));
+    }
+    let mut summary = vec![Span::styled(
+        format!(
+            " All {} sessions · {} tokens",
+            app.snapshot.sessions.len(),
+            format::token_count(app.snapshot.totals.total_tokens)
+        ),
+        theme.header(),
+    )];
+    if app.tab == ViewTab::Dates {
+        if let Some(date) = app.selected_date_stats() {
+            let scope = app
+                .selected_date
+                .map(|scope| scope.label())
+                .unwrap_or_default();
+            summary.push(Span::styled(
+                format!(
+                    "   {scope} · all {}",
+                    format::token_count(date.tokens.total_tokens)
+                ),
+                theme.muted_text(),
+            ));
+        }
+    } else if area.width >= 110 {
+        summary.push(Span::styled(
+            format!(
+                "   today {} · 7d {} · 30d {}",
                 format::token_count(app.snapshot.periods.today.total_tokens),
                 format::token_count(app.snapshot.periods.seven_days.total_tokens),
                 format::token_count(app.snapshot.periods.thirty_days.total_tokens)
@@ -66,26 +98,19 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
             theme.muted_text(),
         ));
     }
-    if area.width >= 110 {
-        spans.push(Span::raw("     "));
-        spans.push(Span::styled(
-            format!("codex {codex} · gjc {gjc} · opencode {opencode}"),
-            theme.muted_text(),
+    if app.snapshot.source_counts.errors > 0 {
+        summary.push(Span::styled(
+            format!("   {} errors", app.snapshot.source_counts.errors),
+            theme.error(),
         ));
-    }
-    if area.width >= 60 {
-        spans.push(Span::raw("     "));
-        spans.push(Span::styled(
-            format!("refreshed {refreshed}"),
-            theme.muted_text(),
-        ));
-    }
-    if !app.snapshot.diagnostics.is_empty() && area.width >= 100 {
-        spans.push(Span::raw("     "));
-        spans.push(Span::styled(
-            format!("{} warnings", app.snapshot.diagnostics.len()),
+    } else if !app.snapshot.diagnostics.is_empty() && area.width >= 130 {
+        summary.push(Span::styled(
+            format!("   {} warnings", app.snapshot.diagnostics.len()),
             theme.warning(),
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(tabs), Line::from(summary)]),
+        area,
+    );
 }

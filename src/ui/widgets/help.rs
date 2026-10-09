@@ -8,18 +8,22 @@ use ratatui::{
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
     let lines = vec![
-        hint(theme, "j / ↓", "next session"),
-        hint(theme, "k / ↑", "previous session"),
-        hint(theme, "J / PgDn", "scroll detail down"),
-        hint(theme, "K / PgUp", "scroll detail up"),
-        hint(theme, "/", "search sessions"),
+        hint(theme, "1 / 2", "Sessions / Dates tabs"),
+        hint(theme, "Tab / ←→", "focus pane; j/k or ↑↓ move"),
+        hint(theme, "[ / ]", "date; Δ versus previous usage day"),
+        hint(theme, "d / p", "open pinned dates / toggle session pin"),
+        hint(theme, "s", "Last used / Tokens (selected day in Dates)"),
+        hint(theme, "/", "search sessions, not global date totals"),
+        hint(
+            theme,
+            "J/K / Pg",
+            "scroll detail; exact totals in breakdown",
+        ),
         hint(theme, "v", "toggle token breakdown"),
-        hint(theme, "d", "select usage date"),
-        hint(theme, "↑↓/Enter/Esc", "pick/apply/cancel"),
         hint(theme, "r", "reload"),
         hint(theme, "? / Esc / q", "close help"),
     ];
-    let popup = centered(area, 48, lines.len().saturating_add(2) as u16);
+    let popup = centered(area, 70, lines.len().saturating_add(2) as u16);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines).block(

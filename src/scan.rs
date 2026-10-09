@@ -1,5 +1,5 @@
 use crate::{
-    diagnostics::{Diagnostic, Severity},
+    diagnostics::Diagnostic,
     domain::{Client, UsageRecord},
 };
 use serde::Serialize;
@@ -32,29 +32,6 @@ pub struct SourceCounts {
     pub records_missing_timestamp_filtered: u64,
     pub warnings: u64,
     pub errors: u64,
-}
-
-impl SourceCounts {
-    pub fn merge_summary(&mut self, summary: &ScanSummary) {
-        self.roots_scanned.extend(summary.roots_scanned.clone());
-        self.missing_roots.extend(summary.missing_roots.clone());
-        self.empty_roots.extend(summary.empty_roots.clone());
-        self.files_scanned += summary.files_scanned;
-        self.lines_read += summary.lines_read;
-        self.records_emitted += summary.records_emitted;
-        self.records_skipped += summary.records_skipped;
-        self.records_time_filtered += summary.records_time_filtered;
-        self.records_missing_timestamp_filtered += summary.records_missing_timestamp_filtered;
-    }
-
-    pub fn merge_diagnostics(&mut self, diagnostics: &[Diagnostic]) {
-        for diagnostic in diagnostics {
-            match diagnostic.severity {
-                Severity::Warning => self.warnings += 1,
-                Severity::Error => self.errors += 1,
-            }
-        }
-    }
 }
 
 #[derive(Clone, Debug)]

@@ -17,6 +17,89 @@ use token_usage::{
 };
 
 #[test]
+fn native_three_source_fixture_matches_independent_token_and_date_ledger() {
+    use serde_json::json;
+    let dir = tempdir().unwrap();
+    let codex_root = dir.path().join("codex");
+    let codex_sessions = codex_root.join("sessions");
+    fs::create_dir_all(&codex_sessions).unwrap();
+    let token_event = json!({"type":"event_msg","timestamp":"2026-03-11T12:00:00Z",
+        "payload":{"type":"token_count","info":{
+            "total_token_usage":{"total_tokens":10},
+            "last_token_usage":{"input_tokens":7,"cached_input_tokens":2,
+                "output_tokens":3,"reasoning_output_tokens":1,"total_tokens":10}}}});
+    fs::write(
+        codex_sessions.join("rollout-name.jsonl"),
+        format!(
+            "{}\n{}\n{token_event}\n{token_event}\n",
+            json!({"type":"session_meta","payload":{"id":"same"}}),
+            json!({"type":"turn_context","payload":{"model":"codex-model","effort":"high"}}),
+        ),
+    )
+    .unwrap();
+    let gjc_root = dir.path().join("gjc");
+    fs::create_dir(&gjc_root).unwrap();
+    fs::write(
+        gjc_root.join("session.jsonl"),
+        format!(
+            "{}\n{}\n",
+            json!({"type":"session","id":"same"}),
+            json!({"type":"message","id":"m","timestamp":"2026-03-11T12:00:00Z",
+            "message":{"role":"assistant","model":"gjc-model",
+                "usage":{"input":3,"cacheRead":5,"cacheWrite":2,"output":4,"totalTokens":14}}}),
+        ),
+    )
+    .unwrap();
+    let db_path = dir.path().join("opencode.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute_batch(
+        "CREATE TABLE session(id TEXT PRIMARY KEY,parent_id TEXT,title TEXT);
+        CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,data TEXT);
+        INSERT INTO session VALUES('same',NULL,'same');",
+    )
+    .unwrap();
+    let at = "2026-03-11T12:00:00Z"
+        .parse::<chrono::DateTime<Utc>>()
+        .unwrap();
+    let data = json!({"role":"assistant","providerID":"p","modelID":"m",
+        "time":{"created":at.timestamp_millis()},
+        "tokens":{"input":2,"cache":{"read":1,"write":1},"output":1,"reasoning":1}});
+    db.execute(
+        "INSERT INTO message VALUES('m','same',?1,?2)",
+        rusqlite::params![at.timestamp_millis(), data.to_string()],
+    )
+    .unwrap();
+    let snapshot = aggregate(vec![
+        sources::codex::parse(&codex_root).unwrap(),
+        sources::gjc::parse(&gjc_root).unwrap(),
+        sources::opencode::parse(&db_path).unwrap(),
+    ])
+    .unwrap();
+    // Independent hand calculation: total 10+14+6; input 7+10+4; output 3+4+2.
+    assert_eq!(
+        snapshot.totals,
+        daily_tokens([30, 21, 10, 8, 3, 9, 2], true)
+    );
+    assert_eq!(snapshot.sessions.len(), 3);
+    assert_eq!(snapshot.dates.len(), 1);
+    assert_eq!(
+        snapshot.dates[0].day,
+        Some(at.with_timezone(&chrono::Local).date_naive())
+    );
+    assert_eq!(snapshot.dates[0].tokens, snapshot.totals);
+    assert_eq!(snapshot.dates[0].record_count, 3);
+    assert_eq!(snapshot.dates[0].sessions.len(), 3);
+    for (client, total) in [("codex", 10), ("gjc", 14), ("opencode", 6)] {
+        let session = resolve_session(&snapshot, &format!("{client}:same")).unwrap();
+        assert_eq!(session.tokens.total_tokens, total);
+        assert_eq!(session.last_used_at, Some(at));
+        daily_assert_partition(session);
+    }
+    assert_eq!(snapshot.source_counts.errors, 0);
+    assert_eq!(snapshot.source_counts.records_skipped, 1);
+}
+
+#[test]
 fn cli_prints_version() {
     let mut cmd = assert_cmd::Command::cargo_bin("token-usage").unwrap();
     cmd.arg("--version")
@@ -59,7 +142,7 @@ fn gjc_fixture_deduplicates_and_keeps_parent() {
 fn aggregate_keeps_source_qualified_sessions_separate() {
     let codex = sources::codex::parse(Path::new("tests/fixtures/codex")).unwrap();
     let gjc = sources::gjc::parse(Path::new("tests/fixtures/gjc")).unwrap();
-    let snapshot = aggregate(vec![codex, gjc]);
+    let snapshot = aggregate(vec![codex, gjc]).unwrap();
     assert!(
         snapshot
             .sessions
@@ -203,13 +286,28 @@ fn codex_cumulative_reset_and_stale_are_skipped_but_later_lines_continue() {
 #[test]
 fn time_aggregation_filters_and_groups_by_day_week_month() {
     let dir = tempdir().unwrap();
-    fs::write(dir.path().join("session.jsonl"), concat!(
-        "{\"type\":\"session\",\"id\":\"s\"}\n",
-        "{\"type\":\"message\",\"id\":\"old\",\"timestamp\":\"2026-08-30T23:59:59Z\",\"message\":{\"role\":\"assistant\",\"model\":\"m\",\"usage\":{\"input\":1,\"output\":1,\"totalTokens\":2}}}\n",
-        "{\"type\":\"message\",\"id\":\"a\",\"timestamp\":\"2026-09-01T00:00:00Z\",\"message\":{\"role\":\"assistant\",\"model\":\"m\",\"usage\":{\"input\":10,\"output\":5,\"totalTokens\":15,\"reasoningTokens\":2}}}\n",
-        "{\"type\":\"message\",\"id\":\"b\",\"timestamp\":\"2026-09-02T00:00:00Z\",\"message\":{\"role\":\"assistant\",\"model\":\"m\",\"usage\":{\"input\":20,\"output\":5,\"totalTokens\":25,\"reasoningTokens\":3}}}\n",
-        "{\"type\":\"message\",\"id\":\"no-ts\",\"message\":{\"role\":\"assistant\",\"model\":\"m\",\"usage\":{\"input\":100,\"output\":100,\"totalTokens\":200}}}\n"
-    )).unwrap();
+    let local_time = |month, day, hour, minute, second| {
+        chrono::Local
+            .with_ymd_and_hms(2026, month, day, hour, minute, second)
+            .unwrap()
+            .with_timezone(&Utc)
+            .to_rfc3339()
+    };
+    let mut lines = vec![serde_json::json!({"type":"session","id":"s"}).to_string()];
+    for (id, at, input, output, total, reasoning) in [
+        ("old", Some(local_time(8, 30, 23, 59, 59)), 1, 1, 2, None),
+        ("a", Some(local_time(9, 1, 0, 0, 0)), 10, 5, 15, Some(2)),
+        ("b", Some(local_time(9, 2, 0, 0, 0)), 20, 5, 25, Some(3)),
+        ("no-ts", None, 100, 100, 200, None),
+    ] {
+        lines.push(
+            serde_json::json!({"type":"message","id":id,"timestamp":at,
+            "message":{"role":"assistant","model":"m","usage":{
+                "input":input,"output":output,"totalTokens":total,"reasoningTokens":reasoning}}})
+            .to_string(),
+        );
+    }
+    fs::write(dir.path().join("session.jsonl"), lines.join("\n")).unwrap();
     let parsed = sources::gjc::parse(dir.path()).unwrap();
     let selection = time::build_selection(
         false,
@@ -271,9 +369,25 @@ fn today_filter_uses_injected_clock_for_non_flaky_tests() {
         .unwrap();
     let selection = time::build_selection(true, None, None, now).unwrap();
     assert_eq!(
-        selection.contains(Some(Utc.with_ymd_and_hms(2026, 9, 14, 3, 0, 0).unwrap())),
+        selection.contains(Some(
+            chrono::Local
+                .with_ymd_and_hms(2026, 9, 14, 9, 0, 0)
+                .unwrap()
+                .with_timezone(&Utc)
+        )),
         time::TimeMatch::Included
     );
+    for (day, hour, minute, second) in [(13, 23, 59, 59), (15, 0, 0, 0)] {
+        assert_eq!(
+            selection.contains(Some(
+                chrono::Local
+                    .with_ymd_and_hms(2026, 9, day, hour, minute, second)
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )),
+            time::TimeMatch::OutsideRange
+        );
+    }
     assert_ne!(selection.contains(None), time::TimeMatch::Included);
 }
 
@@ -631,19 +745,19 @@ fn daily_assert_partition(session: &SessionStats) {
     let mut models = BTreeMap::new();
     let mut efforts = BTreeMap::new();
     for day in &session.daily {
-        tokens.add_assign(&day.tokens);
+        tokens.checked_add_assign(&day.tokens).unwrap();
         count += day.record_count;
         for model in &day.models {
             let entry = models
                 .entry(model.model.clone())
                 .or_insert((TokenStats::default(), 0));
-            entry.0.add_assign(&model.tokens);
+            entry.0.checked_add_assign(&model.tokens).unwrap();
             entry.1 += model.record_count;
             for effort in &model.efforts {
                 let entry = efforts
                     .entry((model.model.clone(), effort.effort.clone()))
                     .or_insert((TokenStats::default(), 0));
-                entry.0.add_assign(&effort.tokens);
+                entry.0.checked_add_assign(&effort.tokens).unwrap();
                 entry.1 += effort.record_count;
             }
         }
@@ -725,7 +839,8 @@ fn daily_session_canonical_partition_models_efforts_and_zero_records() {
             custom.clone(),
             unknown_zero.clone(),
         ),
-    ])]);
+    ])])
+    .unwrap();
     assert_eq!(snapshot.sessions.len(), 1);
     let session = &snapshot.sessions[0];
     assert_eq!(
@@ -835,7 +950,7 @@ fn daily_session_three_sources_root_identity_partition_and_json_shape() {
             .iter()
             .all(|r| r.parent_session_key.is_none())
     );
-    let snapshot = aggregate(vec![codex, gjc, opencode]);
+    let snapshot = aggregate(vec![codex, gjc, opencode]).unwrap();
     assert_eq!(snapshot.sessions.len(), 3);
     assert!(matches!(
         resolve_session(&snapshot, "abc"),
@@ -844,7 +959,8 @@ fn daily_session_three_sources_root_identity_partition_and_json_shape() {
     let codex = resolve_session(&snapshot, "codex:abc").unwrap();
     let gjc = resolve_session(&snapshot, "gjc:same").unwrap();
     let opencode = resolve_session(&snapshot, "opencode:abc").unwrap();
-    let codex_tokens = daily_tokens([150, 100, 80, 20, 0, 40, 10], false);
+    // The cumulative total-only record does not supply reasoning, unlike the first record.
+    let codex_tokens = daily_tokens([150, 100, 80, 20, 0, 40, 10], true);
     let gjc_tokens = daily_tokens([75, 50, 50, 0, 0, 25, 5], false);
     let opencode_tokens = daily_tokens([197, 141, 112, 24, 5, 56, 8], false);
     let anthropic = daily_tokens([192, 139, 110, 24, 5, 53, 8], false);
@@ -920,9 +1036,15 @@ fn daily_session_three_sources_root_identity_partition_and_json_shape() {
     }
 
     let json = serde_json::to_value(&snapshot).unwrap();
-    assert_eq!(json.as_object().unwrap().len(), 6);
+    assert_eq!(json.as_object().unwrap().len(), 7);
+    assert_eq!(
+        json["totals"],
+        serde_json::to_value(&snapshot.totals).unwrap()
+    );
+    assert!(json.get("dates").is_none());
     for field in [
         "generated_at",
+        "totals",
         "sessions",
         "timeline",
         "periods",
@@ -937,7 +1059,7 @@ fn daily_session_three_sources_root_identity_partition_and_json_shape() {
         .iter()
         .zip(&snapshot.sessions)
     {
-        assert_eq!(value.as_object().unwrap().len(), 7);
+        assert_eq!(value.as_object().unwrap().len(), 8);
         assert!(value.get("daily").is_none());
         assert_eq!(value["key"], serde_json::to_value(&session.key).unwrap());
         assert_eq!(
@@ -948,6 +1070,10 @@ fn daily_session_three_sources_root_identity_partition_and_json_shape() {
         assert_eq!(
             value["started_at"],
             serde_json::to_value(session.started_at).unwrap()
+        );
+        assert_eq!(
+            value["last_used_at"],
+            serde_json::to_value(session.last_used_at).unwrap()
         );
         assert_eq!(
             value["tokens"],
@@ -1162,7 +1288,7 @@ fn daily_session_fixed_instants_local_midnight_and_dst() {
             daily_record(Client::Codex, "fixed", Some(timestamp), "m", None, tokens)
         })
         .collect();
-    let snapshot = aggregate(vec![daily_parsed(records)]);
+    let snapshot = aggregate(vec![daily_parsed(records)]).unwrap();
     let session = &snapshot.sessions[0];
     let mut expected = vec![("2026-11-01", daily_tokens([20, 13, 7, 4, 2, 7, 0], true), 2)];
     if zone == "Asia/Seoul" {

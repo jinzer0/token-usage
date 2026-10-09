@@ -44,8 +44,9 @@ jobs:
           mkdir -p "$name"
           cp "target/${{ matrix.target }}/release/token-usage" "$name/token-usage"
           cp README.md "$name/README.md"
+          cp THIRD_PARTY_NOTICES "$name/THIRD_PARTY_NOTICES"
           if [ -f LICENSE ]; then cp LICENSE "$name/LICENSE"; fi
-          tar -czf "$name.tar.gz" -C "$name" .
+          COPYFILE_DISABLE=1 tar -czf "$name.tar.gz" -C "$name" .
           shasum -a 256 "$name.tar.gz" | sed "s#  #  #" > "$name.sha256"
       - name: Package Windows
         if: matrix.archive == 'zip'
@@ -55,6 +56,7 @@ jobs:
           New-Item -ItemType Directory -Path $name | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/token-usage.exe" "$name/token-usage.exe"
           Copy-Item README.md "$name/README.md"
+          Copy-Item THIRD_PARTY_NOTICES "$name/THIRD_PARTY_NOTICES"
           if (Test-Path LICENSE) { Copy-Item LICENSE "$name/LICENSE" }
           Compress-Archive -Path "$name/*" -DestinationPath "$name.zip"
           $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
