@@ -188,7 +188,8 @@ fn parse_file(
         }
         let tokens = if let Some(last) = usage
             .get("last_token_usage")
-            .or_else(|| usage.get("lastTokenUsage"))
+            .filter(|last| !last.is_null())
+            .or_else(|| usage.get("lastTokenUsage").filter(|last| !last.is_null()))
         {
             token_stats(last)
         } else if let Some(total) = cumulative {
@@ -496,6 +497,93 @@ mod tests {
         ));
         assert_eq!(diagnostic.path.as_deref(), Some(path.as_path()));
         assert_eq!(diagnostic.line, Some(1));
+    }
+
+    #[test]
+    fn native_null_last_usage_preserves_initial_and_later_cumulative_deltas() {
+        for field in ["last_token_usage", "lastTokenUsage"] {
+            let root = tempfile::tempdir().unwrap();
+            let sessions = root.path().join("sessions");
+            std::fs::create_dir(&sessions).unwrap();
+            let event = |total, last: Value| {
+                let mut info = json!({"total_token_usage": {"total_tokens": total}});
+                info[field] = last;
+                json!({"type":"event_msg","payload":{"type":"token_count","info":info}})
+            };
+            let values = [
+                json!({"type":"session_meta","payload":{"id":"null-last"}}),
+                json!({"type":"turn_context","payload":{"model":"m","effort":"high"}}),
+                event(10, Value::Null),
+                event(10, Value::Null),
+                event(15, Value::Null),
+                event(
+                    20,
+                    json!({"input_tokens":3,"output_tokens":2,"total_tokens":5,"reasoning_output_tokens":1}),
+                ),
+                event(25, Value::Null),
+            ];
+            std::fs::write(
+                sessions.join("rollout-null.jsonl"),
+                values
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
+            let result = parse(root.path()).unwrap();
+            assert_eq!(
+                result
+                    .records
+                    .iter()
+                    .map(|r| r.tokens.total_tokens)
+                    .collect::<Vec<_>>(),
+                vec![10, 5, 5, 5],
+                "{field}"
+            );
+            assert_eq!(result.summary.records_skipped, 1);
+            for index in [0, 1, 3] {
+                assert!(result.records[index].tokens.reasoning_has_unknown);
+                assert_eq!(result.records[index].tokens.input_total, 0);
+            }
+            assert_eq!(result.records[2].tokens.input_total, 3);
+            assert_eq!(result.records[2].tokens.output_total, 2);
+            assert_eq!(result.records[2].tokens.reasoning_known, 1);
+            assert!(!result.records[2].tokens.reasoning_has_unknown);
+            let snapshot = crate::aggregate::aggregate(vec![result]).unwrap();
+            assert_eq!(snapshot.totals.total_tokens, 25);
+            assert_eq!(snapshot.sessions[0].models[0].tokens.total_tokens, 25);
+            assert!(snapshot.totals.reasoning_has_unknown);
+        }
+    }
+
+    #[test]
+    fn null_snake_case_last_usage_does_not_mask_populated_camel_case_alias() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let values = [
+            json!({"type":"turn_context","payload":{"model":"m"}}),
+            json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"total_tokens":10},"last_token_usage":null,
+                "lastTokenUsage":{"input_tokens":7,"output_tokens":3,"total_tokens":10,"reasoning_output_tokens":0}
+            }}}),
+        ];
+        std::fs::write(
+            sessions.join("rollout-alias.jsonl"),
+            values
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let result = parse(root.path()).unwrap();
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].tokens.input_total, 7);
+        assert_eq!(result.records[0].tokens.output_total, 3);
+        assert_eq!(result.records[0].tokens.total_tokens, 10);
+        assert!(!result.records[0].tokens.reasoning_has_unknown);
     }
 
     #[test]
