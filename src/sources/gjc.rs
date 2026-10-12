@@ -1,14 +1,14 @@
 use crate::{
     diagnostics::Diagnostic,
     domain::{Client, MessageId, ReasoningEffort, SessionId, SessionKey, TokenStats, UsageRecord},
-    scan::{ParseResult, ScanSummary},
+    scan::{ParseResult, ScanSummary, SessionMetadata},
     sources::codex::{string_at, token_stats, u64_at},
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::File,
     io::{BufRead, BufReader},
     path::Path,
@@ -24,12 +24,14 @@ pub fn parse(root: &Path) -> Result<ParseResult> {
         summary.missing_roots.push(root.to_path_buf());
         return Ok(ParseResult {
             records: vec![],
+            session_metadata: vec![],
             diagnostics: vec![],
             summary,
         });
     }
     summary.roots_scanned.push(root.to_path_buf());
     let mut records = Vec::new();
+    let mut session_metadata = Vec::new();
     let mut diagnostics = Vec::new();
     let mut files = 0;
     for entry in WalkDir::new(root)
@@ -41,13 +43,20 @@ pub fn parse(root: &Path) -> Result<ParseResult> {
             continue;
         }
         files += 1;
-        parse_file(entry.path(), &mut records, &mut diagnostics, &mut summary)?;
+        parse_file(
+            entry.path(),
+            &mut records,
+            &mut session_metadata,
+            &mut diagnostics,
+            &mut summary,
+        )?;
     }
     if files == 0 {
         summary.empty_roots.push(root.to_path_buf());
     }
     Ok(ParseResult {
         records,
+        session_metadata,
         diagnostics,
         summary,
     })
@@ -56,6 +65,7 @@ pub fn parse(root: &Path) -> Result<ParseResult> {
 fn parse_file(
     path: &Path,
     records: &mut Vec<UsageRecord>,
+    session_metadata: &mut Vec<SessionMetadata>,
     diagnostics: &mut Vec<Diagnostic>,
     summary: &mut ScanSummary,
 ) -> Result<()> {
@@ -69,6 +79,7 @@ fn parse_file(
     let mut session_id = fallback_id;
     let mut parent_id = None::<String>;
     let mut title = None::<String>;
+    let mut metadata = BTreeMap::<SessionKey, SessionMetadata>::new();
     let mut branch_effort: HashMap<String, Option<ReasoningEffort>> = HashMap::new();
     let mut branch_parent: HashMap<String, String> = HashMap::new();
     let mut seen = HashSet::new();
@@ -99,19 +110,50 @@ fn parse_file(
             if let Some(id) = string_at(&v, &["session_id", "sessionId", "id"]) {
                 session_id = id;
             }
-            if let Some(p) = string_at(
-                &v,
-                &[
-                    "parent_session_id",
-                    "parentSessionId",
-                    "parent_id",
-                    "parentId",
-                ],
-            ) {
-                parent_id = Some(p);
-            }
             if let Some(t) = string_at(&v, &["title", "name"]) {
                 title = Some(t);
+            }
+            let key = SessionKey {
+                client: Client::Gjc,
+                id: SessionId(session_id.clone()),
+            };
+            let entry = metadata
+                .entry(key.clone())
+                .or_insert_with(|| SessionMetadata {
+                    key,
+                    parent_candidates: BTreeMap::new(),
+                    name: None,
+                    source_path: path.to_path_buf(),
+                    source_line: Some(line_no),
+                });
+            if let Some(t) = string_at(&v, &["title", "name"]) {
+                entry.name = Some(t);
+            }
+            let mut next_parent = None;
+            for field in [
+                "parent_session_id",
+                "parentSessionId",
+                "parent_id",
+                "parentId",
+            ] {
+                if let Some(p) = v
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .filter(|p| !p.trim().is_empty())
+                {
+                    next_parent.get_or_insert_with(|| p.to_string());
+                    entry.add_parent(
+                        SessionKey {
+                            client: Client::Gjc,
+                            id: SessionId(p.to_string()),
+                        },
+                        path.to_path_buf(),
+                        Some(line_no),
+                    );
+                }
+            }
+            if next_parent.is_some() {
+                parent_id = next_parent;
             }
         }
         if matches!(typ.as_deref(), Some("thinking_level_change")) {
@@ -245,6 +287,7 @@ fn parse_file(
         });
         summary.records_emitted += 1;
     }
+    session_metadata.extend(metadata.into_values());
     Ok(())
 }
 
@@ -292,6 +335,47 @@ fn resolve_effort(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn metadata_without_usage_keeps_all_parents_and_latest_title_patch() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("child.jsonl"), [
+            json!({"type":"header","session_id":"child","parent_session_id":"a","parentId":"b","title":"Old"}),
+            json!({"type":"header_patch","parent_session_id":null,"title":"Latest"}),
+            json!({"type":"header_patch","parent_session_id":"a","title":null}),
+        ].iter().map(Value::to_string).collect::<Vec<_>>().join("\n")).unwrap();
+        let result = parse(root.path()).unwrap();
+        assert!(result.records.is_empty());
+        assert_eq!(result.summary.records_emitted, 0);
+        let metadata = &result.session_metadata[0];
+        assert_eq!(metadata.key.id.0, "child");
+        assert_eq!(metadata.name.as_deref(), Some("Latest"));
+        assert_eq!(metadata.parent_candidates.len(), 2);
+        assert!(
+            metadata
+                .parent_candidates
+                .values()
+                .all(|(_, line)| *line == Some(1))
+        );
+    }
+
+    #[test]
+    fn late_title_patch_updates_metadata_without_changing_raw_usage_parent() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("child.jsonl"), [
+            json!({"type":"header","session_id":"child","parent_session_id":"root","title":"Before"}),
+            json!({"type":"assistant","message":{"id":"message","model":"m","usage":{"input":3,"output":2}}}),
+            json!({"type":"header_patch","title":"After"}),
+        ].iter().map(Value::to_string).collect::<Vec<_>>().join("\n")).unwrap();
+        let result = parse(root.path()).unwrap();
+        assert_eq!(
+            result.records[0].parent_session_key.as_ref().unwrap().id.0,
+            "root"
+        );
+        assert_eq!(result.records[0].session_name.as_deref(), Some("Before"));
+        assert_eq!(result.session_metadata[0].name.as_deref(), Some("After"));
+        assert_eq!(result.records[0].tokens.total_tokens, 5);
+    }
 
     #[test]
     fn native_input_and_cache_are_disjoint_and_output_does_not_double_count_reasoning() {

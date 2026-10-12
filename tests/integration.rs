@@ -1,5 +1,6 @@
 use chrono::{TimeZone, Utc};
 use clap::Parser;
+use predicates::prelude::PredicateBooleanExt;
 use std::{fs, path::Path};
 use tempfile::tempdir;
 use token_usage::{
@@ -713,6 +714,411 @@ fn daily_parsed(records: Vec<UsageRecord>) -> ParseResult {
         },
         records,
         diagnostics: Vec::new(),
+        session_metadata: Vec::new(),
+    }
+}
+
+// Codex parent shapes are pinned to official openai/codex revision
+// 72f999edc7848961b99c4b98bf1e62d12fa35798, protocol/src/protocol.rs.
+// These are synthetic fixtures, not captured user logs.
+const ROLLUP_ROOT: &str = "11111111-1111-4111-8111-111111111111";
+const ROLLUP_CHILD: &str = "22222222-2222-4222-8222-222222222222";
+const ROLLUP_LEAF: &str = "33333333-3333-4333-8333-333333333333";
+const ROLLUP_FORK: &str = "44444444-4444-4444-8444-444444444444";
+
+fn rollup_source_fixture(base: &Path, client: Client) -> std::path::PathBuf {
+    use serde_json::json;
+    let root = base.join(client.to_string());
+    let logs = if client == Client::Codex {
+        root.join("sessions")
+    } else {
+        root.clone()
+    };
+    fs::create_dir_all(&logs).unwrap();
+    if client == Client::Codex {
+        fs::write(
+            root.join("session_index.jsonl"),
+            format!("{}\n", json!({"id":ROLLUP_ROOT,"name":"Rollup root"})),
+        )
+        .unwrap();
+    }
+    for (id, parent, events) in [
+        (ROLLUP_ROOT, None, vec![]),
+        (
+            ROLLUP_CHILD,
+            Some(ROLLUP_ROOT),
+            vec![(1, "2026-09-01T12:00:00Z")],
+        ),
+        (
+            ROLLUP_LEAF,
+            Some(ROLLUP_CHILD),
+            vec![(2, "2026-09-02T12:00:00Z"), (3, "2026-09-03T12:00:00Z")],
+        ),
+        (ROLLUP_FORK, None, vec![(1, "2026-09-01T12:00:00Z")]),
+    ] {
+        let mut lines = Vec::new();
+        if client == Client::Codex {
+            let mut meta = json!({"type":"session_meta","payload":{"id":id}});
+            if let Some(parent) = parent {
+                if id == ROLLUP_LEAF {
+                    meta["payload"]["source"] =
+                        json!({"subagent":{"thread_spawn":{"parent_thread_id":parent,"depth":2}}});
+                } else {
+                    meta["payload"]["parent_thread_id"] = json!(parent);
+                }
+            } else if id == ROLLUP_FORK {
+                meta["payload"]["forked_from_id"] = json!(ROLLUP_ROOT);
+                meta["payload"]["session_id"] = json!(ROLLUP_ROOT);
+            }
+            lines.push(meta);
+            lines.push(json!({"type":"turn_context","payload":{"model":id,"effort":"high"}}));
+        } else {
+            let mut meta = json!({"type":"header","id":id,"title":"Child title"});
+            if let Some(parent) = parent {
+                meta["parent_session_id"] = json!(parent);
+            }
+            lines.push(meta);
+            lines.push(json!({"type":"thinking_level_change","effort":"high"}));
+        }
+        let mut cumulative = 0;
+        for (index, (scale, timestamp)) in events.into_iter().enumerate() {
+            cumulative += 10 * scale;
+            lines.push(if client == Client::Codex {
+                json!({"type":"event_msg","timestamp":timestamp,"payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":cumulative},
+                    "last_token_usage":{"input_tokens":6*scale,"cached_input_tokens":2*scale,
+                        "output_tokens":4*scale,"reasoning_output_tokens":scale,"total_tokens":10*scale}}}})
+            } else {
+                json!({"type":"message","id":format!("{id}-{index}"),"timestamp":timestamp,
+                    "message":{"role":"assistant","model":id,"usage":{"input":3*scale,
+                        "cacheRead":2*scale,"cacheWrite":scale,"output":4*scale,
+                        "reasoningTokens":scale,"totalTokens":10*scale}}})
+            });
+        }
+        if client == Client::Gjc && id == ROLLUP_ROOT {
+            lines.push(json!({"type":"header_patch","title":"Rollup root"}));
+        }
+        fs::write(
+            logs.join(format!("{id}.jsonl")),
+            lines
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+    }
+    root
+}
+
+fn parse_rollup(root: &Path, client: Client) -> ParseResult {
+    match client {
+        Client::Gjc => sources::gjc::parse(root).unwrap(),
+        Client::Codex => sources::codex::parse(root).unwrap(),
+        Client::OpenCode => unreachable!(),
+    }
+}
+
+#[test]
+fn native_rollup_preserves_components_models_dates_and_source_identity() {
+    let dir = tempdir().unwrap();
+    let mut results = Vec::new();
+    for client in [Client::Gjc, Client::Codex] {
+        let root = rollup_source_fixture(dir.path(), client);
+        let parsed = parse_rollup(&root, client);
+        assert_eq!(parsed.summary.records_emitted, 4);
+        assert_eq!(parsed.session_metadata.len(), 4);
+        results.push(parsed);
+    }
+    let snapshot = aggregate(results).unwrap();
+    assert_eq!(snapshot.sessions.len(), 4);
+    assert_eq!(snapshot.totals.total_tokens, 140);
+    for client in [Client::Gjc, Client::Codex] {
+        let session = resolve_session(&snapshot, &format!("{client}:{ROLLUP_ROOT}")).unwrap();
+        assert_eq!(session.name.as_deref(), Some("Rollup root"));
+        assert!(session.parent.is_none());
+        assert_eq!(session.record_count, 3);
+        assert_eq!(session.tokens.total_tokens, 60);
+        assert_eq!(session.tokens.input_total, 36);
+        assert_eq!(session.tokens.output_total, 24);
+        assert_eq!(session.tokens.cache_read, 12);
+        assert_eq!(
+            session.tokens.cache_write,
+            if client == Client::Gjc { 6 } else { 0 }
+        );
+        assert_eq!(session.tokens.reasoning_known, 6);
+        assert_eq!(session.models.len(), 2);
+        assert_eq!(session.daily.len(), 3);
+        for model in &session.models {
+            assert_eq!(model.efforts.len(), 1);
+            assert_eq!(model.efforts[0].effort, Some(ReasoningEffort::High));
+        }
+        daily_assert_partition(session);
+        assert!(resolve_session(&snapshot, &format!("{client}:{ROLLUP_CHILD}")).is_err());
+        assert!(resolve_session(&snapshot, &format!("{client}:{ROLLUP_LEAF}")).is_err());
+        assert_eq!(
+            resolve_session(&snapshot, &format!("{client}:{ROLLUP_FORK}"))
+                .unwrap()
+                .tokens
+                .total_tokens,
+            10
+        );
+    }
+    assert!(snapshot.diagnostics.is_empty());
+}
+
+#[test]
+fn native_rollup_period_selection_keeps_usage_free_root_and_unfiltered_recency() {
+    let dir = tempdir().unwrap();
+    for client in [Client::Gjc, Client::Codex] {
+        let root = rollup_source_fixture(dir.path(), client);
+        let snapshot = aggregate_with_options(
+            vec![parse_rollup(&root, client)],
+            &AggregateOptions {
+                time_selection: time::TimeSelection {
+                    since: Some("2026-09-02T00:00:00Z".parse().unwrap()),
+                    until: Some("2026-09-03T00:00:00Z".parse().unwrap()),
+                },
+                group_by: Some(GroupBy::Day),
+            },
+        )
+        .unwrap();
+        assert_eq!(snapshot.sessions.len(), 1);
+        let session = &snapshot.sessions[0];
+        assert_eq!(session.key.id.0, ROLLUP_ROOT);
+        assert_eq!(session.name.as_deref(), Some("Rollup root"));
+        assert_eq!(session.tokens.total_tokens, 20);
+        assert_eq!(session.record_count, 1);
+        assert_eq!(
+            session.started_at,
+            Some("2026-09-02T12:00:00Z".parse().unwrap())
+        );
+        assert_eq!(
+            session.last_used_at,
+            Some("2026-09-03T12:00:00Z".parse().unwrap())
+        );
+        assert_eq!(snapshot.source_counts.records_time_filtered, 3);
+        assert_eq!(snapshot.timeline.len(), 1);
+        assert_eq!(snapshot.timeline[0].tokens.total_tokens, 20);
+        assert_eq!(snapshot.dates[0].sessions.len(), 1);
+        daily_assert_partition(session);
+    }
+}
+
+#[test]
+fn cli_rollup_json_summary_and_root_selector_share_one_snapshot() {
+    let dir = tempdir().unwrap();
+    let gjc = rollup_source_fixture(dir.path(), Client::Gjc);
+    let codex = rollup_source_fixture(dir.path(), Client::Codex);
+    let mut command = assert_cmd::Command::cargo_bin("token-usage").unwrap();
+    let output = command
+        .args(["--client", "all", "--gjc-home"])
+        .arg(&gjc)
+        .arg("--codex-home")
+        .arg(&codex)
+        .arg("--opencode-db")
+        .arg(dir.path().join("absent.db"))
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["totals"]["total_tokens"], 140);
+    let sessions = json["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 4);
+    assert!(
+        sessions
+            .iter()
+            .all(|session| session["key"]["id"] != ROLLUP_CHILD
+                && session["key"]["id"] != ROLLUP_LEAF)
+    );
+    for client in [Client::Gjc, Client::Codex] {
+        let root = if client == Client::Gjc { &gjc } else { &codex };
+        let flag = if client == Client::Gjc {
+            "--gjc-home"
+        } else {
+            "--codex-home"
+        };
+        let mut summary = assert_cmd::Command::cargo_bin("token-usage").unwrap();
+        summary
+            .args(["--client", &client.to_string(), flag])
+            .arg(root)
+            .assert()
+            .success()
+            .stdout(predicates::str::contains("Rollup root"))
+            .stdout(predicates::str::contains(ROLLUP_CHILD).not());
+        let mut detail = assert_cmd::Command::cargo_bin("token-usage").unwrap();
+        detail
+            .args(["--client", &client.to_string(), flag])
+            .arg(root)
+            .arg(format!("{client}:{ROLLUP_ROOT}"))
+            .assert()
+            .success()
+            .stdout(predicates::str::contains("Rollup root"));
+        let mut child = assert_cmd::Command::cargo_bin("token-usage").unwrap();
+        child
+            .args(["--client", &client.to_string(), flag])
+            .arg(root)
+            .arg(format!("{client}:{ROLLUP_CHILD}"))
+            .assert()
+            .failure();
+    }
+}
+
+#[test]
+fn cli_rollup_out_of_period_conflict_is_source_isolated_and_sticky() {
+    use serde_json::json;
+    let dir = tempdir().unwrap();
+    let gjc = rollup_source_fixture(dir.path(), Client::Gjc);
+    let codex = rollup_source_fixture(dir.path(), Client::Codex);
+    for (client, root) in [(Client::Gjc, &gjc), (Client::Codex, &codex)] {
+        let logs = if client == Client::Codex {
+            root.join("sessions")
+        } else {
+            root.clone()
+        };
+        let path = logs.join(format!("{ROLLUP_CHILD}.jsonl"));
+        let mut lines = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        lines.last_mut().unwrap()["timestamp"] = json!("2026-09-02T12:00:00Z");
+        if client == Client::Gjc {
+            let patches = [
+                json!({"type":"header_patch","parent_session_id":ROLLUP_FORK,"timestamp":"2026-09-01T12:00:00Z"}),
+                json!({"type":"header_patch","parent_session_id":ROLLUP_ROOT,"title":"Final child"}),
+                json!({"type":"header_patch","parent_session_id":null}),
+            ];
+            lines.splice(1..1, patches);
+        }
+        fs::write(
+            &path,
+            lines.iter().map(|v| format!("{v}\n")).collect::<String>(),
+        )
+        .unwrap();
+    }
+    let mut command = assert_cmd::Command::cargo_bin("token-usage").unwrap();
+    let output = command
+        .args(["--client", "all", "--gjc-home"])
+        .arg(&gjc)
+        .arg("--codex-home")
+        .arg(&codex)
+        .arg("--opencode-db")
+        .arg(dir.path().join("absent.db"))
+        .args(["--since", "2026-09-02", "--until", "2026-09-02", "--json"])
+        .env("TZ", "UTC")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["totals"]["total_tokens"], 60);
+    let sessions = json["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 2);
+    for (client, id) in [("gjc", ROLLUP_CHILD), ("codex", ROLLUP_ROOT)] {
+        let session = sessions
+            .iter()
+            .find(|s| s["key"]["client"] == client)
+            .unwrap();
+        assert_eq!(session["key"]["id"], id);
+        assert_eq!(session["tokens"]["total_tokens"], 30);
+        assert_eq!(session["record_count"], 2);
+        assert_eq!(session["last_used_at"], "2026-09-03T12:00:00Z");
+    }
+    assert_eq!(json["source_counts"]["records_skipped"], 0);
+    assert_eq!(json["source_counts"]["warnings"], 1);
+    let conflicts = json["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["code"] == "GjcParentConflict")
+        .collect::<Vec<_>>();
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0]["client"], "gjc");
+}
+
+#[test]
+fn cli_rollup_self_cycle_entries_and_orphan_descendants_preserve_usage() {
+    use serde_json::json;
+    let dir = tempdir().unwrap();
+    for client in [Client::Gjc, Client::Codex] {
+        let root = dir.path().join(client.to_string());
+        let logs = if client == Client::Codex {
+            root.join("sessions")
+        } else {
+            root.clone()
+        };
+        fs::create_dir_all(&logs).unwrap();
+        for (id, parent, total) in [
+            ("self", "self", 7),
+            ("entry", "self", 11),
+            ("orphan", "missing", 13),
+            ("orphan-leaf", "orphan", 17),
+        ] {
+            let lines = if client == Client::Codex {
+                vec![
+                    json!({"type":"session_meta","payload":{"id":id,"parent_thread_id":parent}}),
+                    json!({"type":"turn_context","payload":{"model":"m"}}),
+                    json!({"type":"event_msg","timestamp":"2026-09-02T12:00:00Z","payload":{"type":"token_count","info":{
+                        "total_token_usage":{"total_tokens":total},
+                        "last_token_usage":{"input_tokens":total-1,"output_tokens":1,"total_tokens":total}}}}),
+                ]
+            } else {
+                vec![
+                    json!({"type":"header","id":id,"parent_session_id":parent}),
+                    json!({"type":"message","id":"m","timestamp":"2026-09-02T12:00:00Z",
+                        "message":{"role":"assistant","model":"m","usage":{"input":total-1,"output":1,"totalTokens":total}}}),
+                ]
+            };
+            fs::write(
+                logs.join(format!("{id}.jsonl")),
+                lines.iter().map(|v| format!("{v}\n")).collect::<String>(),
+            )
+            .unwrap();
+        }
+        let flag = if client == Client::Gjc {
+            "--gjc-home"
+        } else {
+            "--codex-home"
+        };
+        let mut command = assert_cmd::Command::cargo_bin("token-usage").unwrap();
+        let output = command
+            .args(["--client", &client.to_string(), flag])
+            .arg(&root)
+            .arg("--json")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(json["totals"]["total_tokens"], 48);
+        assert_eq!(json["source_counts"]["records_emitted"], 4);
+        assert_eq!(json["source_counts"]["records_skipped"], 0);
+        assert_eq!(json["source_counts"]["warnings"], 2);
+        let sessions = json["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 3);
+        for (id, total, count) in [("self", 7, 1), ("entry", 11, 1), ("orphan", 30, 2)] {
+            let session = sessions.iter().find(|s| s["key"]["id"] == id).unwrap();
+            assert_eq!(session["tokens"]["total_tokens"], total);
+            assert_eq!(session["record_count"], count);
+        }
+        let codes = json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["code"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        let prefix = if client == Client::Gjc {
+            "Gjc"
+        } else {
+            "Codex"
+        };
+        assert!(codes.contains(&format!("{prefix}SessionCycle").as_str()));
+        assert!(codes.contains(&format!("{prefix}OrphanSession").as_str()));
     }
 }
 

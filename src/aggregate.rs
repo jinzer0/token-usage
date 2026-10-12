@@ -1,7 +1,7 @@
 use crate::{
     diagnostics::{Diagnostic, Severity},
-    domain::{ReasoningEffort, SessionKey, TokenStats},
-    scan::{ParseResult, SourceCounts},
+    domain::{Client, ReasoningEffort, SessionKey, TokenStats},
+    scan::{ParseResult, SessionMetadata, SourceCounts},
     time::{GroupBy, TimeMatch, TimeSelection, bucket_start},
 };
 use anyhow::{Context, Result};
@@ -116,6 +116,13 @@ pub fn aggregate_with_options(
 ) -> Result<AggregateSnapshot> {
     let mut source_counts = SourceCounts::default();
     let mut diagnostics = Vec::new();
+    let graph = collect_sessions(&results);
+    let roots = resolve_roots(&graph, &mut diagnostics)?;
+    checked_count(
+        &mut source_counts.warnings,
+        diagnostics.len() as u64,
+        "warnings",
+    )?;
     let mut by_session: BTreeMap<SessionKey, tokscale::SessionAccumulator> = BTreeMap::new();
     let mut timeline: BTreeMap<DateTime<Utc>, TimeBucket> = BTreeMap::new();
     let mut periods = PeriodUsage::default();
@@ -133,7 +140,12 @@ pub fn aggregate_with_options(
     for result in results {
         merge_source_counts(&mut source_counts, &result)?;
         diagnostics.extend(result.diagnostics);
-        for record in result.records {
+        for mut record in result.records {
+            if let Some(root) = roots.get(&record.session_key) {
+                record.session_key = root.clone();
+                record.session_name = graph[root].name.clone();
+                record.parent_session_key = None;
+            }
             let session = by_session.entry(record.session_key.clone()).or_default();
             session.observe_timestamp(record.started_at);
             match options.time_selection.contains(record.started_at) {
@@ -247,6 +259,171 @@ pub fn aggregate_with_options(
         diagnostics,
         source_counts,
     })
+}
+
+fn rollup_client(client: Client) -> bool {
+    matches!(client, Client::Gjc | Client::Codex)
+}
+
+fn collect_sessions(results: &[ParseResult]) -> BTreeMap<SessionKey, SessionMetadata> {
+    let mut graph = BTreeMap::<SessionKey, SessionMetadata>::new();
+    // Complete metadata titles first, so earlier usage cannot hide late patches.
+    let mut metadata = results
+        .iter()
+        .flat_map(|r| &r.session_metadata)
+        .collect::<Vec<_>>();
+    metadata.sort_by(|a, b| {
+        (&a.source_path, a.source_line, &a.name).cmp(&(&b.source_path, b.source_line, &b.name))
+    });
+    for item in metadata {
+        if !rollup_client(item.key.client) {
+            continue;
+        }
+        let entry = graph
+            .entry(item.key.clone())
+            .or_insert_with(|| item.clone());
+        if entry.name.is_none() {
+            entry.name = item.name.clone();
+        }
+        for (parent, (path, line)) in &item.parent_candidates {
+            entry.add_parent(parent.clone(), path.clone(), *line);
+        }
+    }
+    let mut records = results.iter().flat_map(|r| &r.records).collect::<Vec<_>>();
+    records.sort_by(|a, b| {
+        (&a.source_path, a.source_line, &a.session_name).cmp(&(
+            &b.source_path,
+            b.source_line,
+            &b.session_name,
+        ))
+    });
+    for record in records {
+        if !rollup_client(record.session_key.client) {
+            continue;
+        }
+        let entry = graph
+            .entry(record.session_key.clone())
+            .or_insert_with(|| SessionMetadata {
+                key: record.session_key.clone(),
+                parent_candidates: BTreeMap::new(),
+                name: None,
+                source_path: record.source_path.clone(),
+                source_line: record.source_line,
+            });
+        if entry.name.is_none() {
+            entry.name = record.session_name.clone();
+        }
+        if let Some(parent) = &record.parent_session_key {
+            entry.add_parent(
+                parent.clone(),
+                record.source_path.clone(),
+                record.source_line,
+            );
+        }
+    }
+    graph
+}
+
+fn resolve_roots(
+    graph: &BTreeMap<SessionKey, SessionMetadata>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<BTreeMap<SessionKey, SessionKey>> {
+    let mut edges = BTreeMap::new();
+    for (key, item) in graph {
+        let prefix = if key.client == Client::Gjc {
+            "Gjc"
+        } else {
+            "Codex"
+        };
+        if item.parent_candidates.len() > 1 {
+            let (path, line) = item
+                .parent_candidates
+                .values()
+                .min()
+                .expect("multiple parent candidates");
+            let parents = item
+                .parent_candidates
+                .keys()
+                .map(SessionKey::qualified)
+                .collect::<Vec<_>>();
+            diagnostics.push(Diagnostic::warning(
+                key.client,
+                format!("{prefix}ParentConflict"),
+                format!(
+                    "{} has conflicting parents {parents:?}; outgoing edge excluded",
+                    key.qualified()
+                ),
+                Some(path.clone()),
+                *line,
+            ));
+        } else if let Some((parent, (path, line))) = item.parent_candidates.iter().next() {
+            if parent.client == key.client && graph.contains_key(parent) {
+                edges.insert(key.clone(), parent.clone());
+            } else {
+                diagnostics.push(Diagnostic::warning(
+                    key.client,
+                    format!("{prefix}OrphanSession"),
+                    format!(
+                        "{} parent {} is missing; retaining last existing ancestor",
+                        key.qualified(),
+                        parent.qualified()
+                    ),
+                    Some(path.clone()),
+                    *line,
+                ));
+            }
+        }
+    }
+    // None means the chain reaches a cycle: every such start retains its own ID.
+    let mut memo = BTreeMap::<SessionKey, Option<SessionKey>>::new();
+    for start in graph.keys() {
+        if memo.contains_key(start) {
+            continue;
+        }
+        let mut path = Vec::new();
+        let mut positions = BTreeMap::new();
+        let mut current = start.clone();
+        let resolution = loop {
+            if let Some(resolved) = memo.get(&current) {
+                break resolved.clone();
+            }
+            if let Some(&position) = positions.get(&current) {
+                let cycle: &[SessionKey] = &path[position..];
+                let representative = cycle.iter().min().expect("cycle is nonempty");
+                let item = &graph[representative];
+                let (source_path, source_line) = item
+                    .parent_candidates
+                    .values()
+                    .next()
+                    .expect("cycle node has a parent");
+                let prefix = if representative.client == Client::Gjc {
+                    "Gjc"
+                } else {
+                    "Codex"
+                };
+                diagnostics.push(Diagnostic::warning(representative.client, format!("{prefix}SessionCycle"),
+                    format!("parent cycle containing {}; cycle-reaching sessions retain original identities", representative.qualified()),
+                    Some(source_path.clone()), *source_line));
+                break None;
+            }
+            positions.insert(current.clone(), path.len());
+            path.push(current.clone());
+            match edges.get(&current) {
+                Some(parent) => current = parent.clone(),
+                None => break Some(current),
+            }
+        };
+        for key in path {
+            memo.insert(key, resolution.clone());
+        }
+    }
+    Ok(memo
+        .into_iter()
+        .map(|(key, root)| {
+            let root = root.unwrap_or_else(|| key.clone());
+            (key, root)
+        })
+        .collect())
 }
 
 fn checked_count(sum: &mut u64, value: u64, field: &str) -> Result<()> {
@@ -368,6 +545,198 @@ mod tests {
         let mut result = ParseResult::empty(Client::Gjc, "fixture".into());
         result.records = records;
         result
+    }
+
+    fn metadata(client: Client, id: &str, parents: &[&str], name: Option<&str>) -> SessionMetadata {
+        let mut item = SessionMetadata {
+            key: SessionKey {
+                client,
+                id: SessionId(id.into()),
+            },
+            parent_candidates: BTreeMap::new(),
+            name: name.map(str::to_string),
+            source_path: "metadata".into(),
+            source_line: Some(1),
+        };
+        for parent in parents {
+            item.add_parent(
+                SessionKey {
+                    client,
+                    id: SessionId((*parent).into()),
+                },
+                "metadata".into(),
+                Some(1),
+            );
+        }
+        item
+    }
+
+    #[test]
+    fn candidate_union_is_sticky_and_locations_are_minimum() {
+        let mut first = fixture(Vec::new());
+        let mut child = metadata(Client::Gjc, "child", &["a", "b"], Some("Child"));
+        child.add_parent(
+            metadata(Client::Gjc, "a", &[], None).key,
+            "aaa".into(),
+            Some(9),
+        );
+        first.session_metadata = vec![
+            child,
+            metadata(Client::Gjc, "a", &[], None),
+            metadata(Client::Gjc, "b", &[], None),
+        ];
+        let mut record = fixture_record(Client::Gjc, "child", None, field_tokens(6, 3));
+        record.parent_session_key = Some(metadata(Client::Gjc, "a", &[], None).key);
+        let mut second = fixture(vec![
+            record,
+            fixture_record(Client::Gjc, "grandchild", None, field_tokens(6, 4)),
+        ]);
+        second.session_metadata = vec![
+            metadata(Client::Gjc, "child", &["a"], None),
+            metadata(Client::Gjc, "grandchild", &["child"], None),
+        ];
+        let graph = collect_sessions(&[first.clone(), second.clone()]);
+        let child_key = metadata(Client::Gjc, "child", &[], None).key;
+        assert_eq!(graph[&child_key].parent_candidates.len(), 2);
+        assert_eq!(
+            graph[&child_key].parent_candidates[&metadata(Client::Gjc, "a", &[], None).key],
+            ("aaa".into(), Some(9))
+        );
+        let mut diagnostics = Vec::new();
+        let roots = resolve_roots(&graph, &mut diagnostics).unwrap();
+        assert_eq!(
+            roots[&metadata(Client::Gjc, "grandchild", &[], None).key],
+            child_key
+        );
+        for results in [vec![first.clone(), second.clone()], vec![second, first]] {
+            let snapshot = aggregate(results).unwrap();
+            assert_eq!(snapshot.sessions.len(), 1);
+            assert_eq!(snapshot.sessions[0].key, child_key);
+            assert_eq!(snapshot.sessions[0].record_count, 2);
+            assert_eq!(snapshot.source_counts.warnings, 1);
+            assert_eq!(snapshot.source_counts.records_skipped, 0);
+            assert_eq!(snapshot.totals.total_tokens, 7);
+            assert_eq!(snapshot.diagnostics[0].code, "GjcParentConflict");
+            assert_eq!(snapshot.diagnostics[0].path, Some("aaa".into()));
+            assert_eq!(snapshot.diagnostics[0].line, Some(9));
+        }
+    }
+
+    #[test]
+    fn iterative_resolver_handles_deep_chains_cycle_entries_orphans_and_mixed_keys() {
+        let mut result = fixture(Vec::new());
+        result
+            .session_metadata
+            .push(metadata(Client::Gjc, "0", &[], Some("Root")));
+        for index in 1..2000 {
+            result.session_metadata.push(metadata(
+                Client::Gjc,
+                &index.to_string(),
+                &[&(index - 1).to_string()],
+                None,
+            ));
+        }
+        result.session_metadata.extend([
+            metadata(Client::Codex, "0", &[], Some("Other source")),
+            metadata(Client::Gjc, "a", &["b"], None),
+            metadata(Client::Gjc, "b", &["a"], None),
+            metadata(Client::Gjc, "entry", &["a"], None),
+            metadata(Client::Gjc, "orphan", &["missing"], None),
+            metadata(Client::Gjc, "orphan-child", &["orphan"], None),
+        ]);
+        let graph = collect_sessions(&[result]);
+        let mut diagnostics = Vec::new();
+        let roots = resolve_roots(&graph, &mut diagnostics).unwrap();
+        let key = |client, id| metadata(client, id, &[], None).key;
+        assert_eq!(roots[&key(Client::Gjc, "1999")], key(Client::Gjc, "0"));
+        assert_eq!(roots[&key(Client::Codex, "0")], key(Client::Codex, "0"));
+        for id in ["a", "b", "entry"] {
+            assert_eq!(roots[&key(Client::Gjc, id)], key(Client::Gjc, id));
+        }
+        assert_eq!(
+            roots[&key(Client::Gjc, "orphan-child")],
+            key(Client::Gjc, "orphan")
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|d| d.code == "GjcSessionCycle")
+                .count(),
+            1
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|d| d.code == "GjcOrphanSession")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn lineage_and_root_recency_are_resolved_before_time_filtering() {
+        let early: DateTime<Utc> = "2026-03-10T12:00:00Z".parse().unwrap();
+        let late = early + Duration::days(2);
+        let mut result = fixture(vec![
+            fixture_record(Client::Gjc, "child", Some(early), field_tokens(6, 7)),
+            fixture_record(Client::Gjc, "root", Some(late), field_tokens(6, u64::MAX)),
+        ]);
+        result.session_metadata = vec![
+            metadata(Client::Gjc, "root", &[], Some("Root title")),
+            metadata(Client::Gjc, "child", &["root"], Some("Child title")),
+        ];
+        let snapshot = aggregate_with_options(
+            vec![result],
+            &AggregateOptions {
+                time_selection: TimeSelection {
+                    since: Some(early),
+                    until: Some(early + Duration::seconds(1)),
+                },
+                group_by: Some(GroupBy::Day),
+            },
+        )
+        .unwrap();
+        assert_eq!(snapshot.sessions.len(), 1);
+        let session = &snapshot.sessions[0];
+        assert_eq!(session.key.id.0, "root");
+        assert_eq!(session.name.as_deref(), Some("Root title"));
+        assert_eq!(session.started_at, Some(early));
+        assert_eq!(session.last_used_at, Some(late));
+        assert_eq!(session.tokens.total_tokens, 7);
+        assert_eq!(snapshot.timeline[0].tokens.total_tokens, 7);
+        assert_eq!(snapshot.dates[0].tokens.total_tokens, 7);
+        assert_eq!(snapshot.source_counts.records_time_filtered, 1);
+    }
+
+    #[test]
+    fn rollup_preserves_periods_tokens_titles_and_overflow() {
+        let at = Utc::now() + Duration::seconds(1);
+        let mut record = fixture_record(Client::Gjc, "child", Some(at), field_tokens(6, 7));
+        record.session_name = Some("Child must not leak".into());
+        record.reasoning_effort = Some(ReasoningEffort::High);
+        let mut result = fixture(vec![record.clone()]);
+        result.session_metadata = vec![
+            metadata(Client::Gjc, "root", &[], None),
+            metadata(Client::Gjc, "child", &["root"], Some("Child")),
+        ];
+        let snapshot = aggregate(vec![result.clone()]).unwrap();
+        assert_eq!(snapshot.sessions[0].key.id.0, "root");
+        assert!(snapshot.sessions[0].name.is_none());
+        assert!(snapshot.sessions[0].parent.is_none());
+        assert_eq!(
+            snapshot.sessions[0].models[0].efforts[0].effort,
+            Some(ReasoningEffort::High)
+        );
+        assert_eq!(snapshot.totals, record.tokens);
+        assert_eq!(snapshot.periods.today, record.tokens);
+        assert_eq!(snapshot.periods.seven_days, record.tokens);
+        assert_eq!(snapshot.periods.thirty_days, record.tokens);
+        result.records[0].tokens.total_tokens = u64::MAX;
+        result.records[0].started_at = None;
+        record.started_at = None;
+        record.tokens.total_tokens = 1;
+        result.records.push(record);
+        assert!(format!("{:#}", aggregate(vec![result]).unwrap_err()).contains("total_tokens"));
     }
 
     fn field_tokens(field: usize, value: u64) -> TokenStats {
