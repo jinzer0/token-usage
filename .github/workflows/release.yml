@@ -80,9 +80,10 @@ jobs:
           merge-multiple: true
       - name: Create SHA256SUMS
         shell: bash
+        working-directory: dist
         run: |
           set -euo pipefail
-          find dist -name '*.sha256' -exec cat {} \; > dist/SHA256SUMS
+          sha256sum *.tar.gz *.zip > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           files: |
