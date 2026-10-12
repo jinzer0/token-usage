@@ -32,8 +32,8 @@ token-usage --version
 예:
 
 ```bash
-curl -LO https://github.com/jinzer0/token-usage/releases/download/v0.4.0/token-usage-v0.4.0-aarch64-apple-darwin.tar.gz
-tar -xzf token-usage-v0.4.0-aarch64-apple-darwin.tar.gz
+curl -LO https://github.com/jinzer0/token-usage/releases/download/v0.5.0/token-usage-v0.5.0-aarch64-apple-darwin.tar.gz
+tar -xzf token-usage-v0.5.0-aarch64-apple-darwin.tar.gz
 mkdir -p ~/.local/bin
 mv token-usage ~/.local/bin/
 token-usage --version
@@ -46,10 +46,11 @@ Release에는 `SHA256SUMS`가 포함되며, `install.sh`는 가능한 환경에�
 - Codex 로그: 기본 경로 `~/.codex`
   - `sessions/**/*.jsonl` 스캔
   - `session_index.jsonl`의 세션 이름 반영
+  - 명시적 서브에이전트 부모 관계를 따라 최상위 부모에 사용량 합산
 - GJC 로그: 기본 경로 `~/.gjc/agent/sessions`
   - `**/*.jsonl` 스캔
   - 중복 assistant usage 메시지 제거
-  - 부모 세션 정보와 branch별 reasoning effort 반영
+  - 서브에이전트 사용량을 최상위 부모에 합산하고 branch별 reasoning effort 보존
 - OpenCode SQLite: 기본 경로 `~/.local/share/opencode/opencode.db`
   - `XDG_DATA_HOME`이 설정되면 `$XDG_DATA_HOME/opencode/opencode.db`
   - `OPENCODE_DB`는 절대 경로 또는 OpenCode 데이터 디렉터리 기준 상대 경로
@@ -100,6 +101,16 @@ token-usage [OPTIONS] [SESSION]
 | `[SESSION]` | 특정 세션 상세 출력. 세션 id, prefix, 이름 prefix, `client:id` 사용 가능 |
 
 `--json`과 `--tui`는 동시에 사용할 수 없습니다.
+
+### 서브에이전트 세션 합산
+
+GJC·Codex·OpenCode 모두 기본적으로 정상 하위 세션의 사용량을 최상위 부모에 한 번만 합산합니다. CLI·JSON·TUI에는 루트 ID와 루트 이름만 표시하며, 하위 ID의 별도 행이나 선택 별칭은 없습니다. 모델·effort·캐시·추론·사용 날짜와 전체 토큰 총량은 보존합니다.
+
+부모 관계는 기간 필터와 무관하게 해석합니다. 사용량 없이 헤더만 있는 부모도 계보에 남고, 조회 기간 안의 실제 사용량만 루트에 더합니다. 루트의 시작 시각은 포함된 사용량의 최초 시각, 마지막 사용 시각은 기간 필터 전 전체 계보의 최종 사용 시각입니다. 부모 로그가 누락되면 마지막으로 확인 가능한 조상에 합산하고 경고합니다. 순환에 연결된 세션은 원래 ID별로 유지하고 경고하며 사용량을 버리지 않습니다.
+
+Codex는 `session_meta.payload.parent_thread_id` 또는 `session_meta.payload.source.subagent.thread_spawn.parent_thread_id`의 명시적 부모를 사용합니다. 일반 fork의 `forked_from_id`, 공유 `session_id`, 이름·시간·깊이만으로는 관계를 추정하지 않습니다. 명시적 관계가 없으면 독립 세션입니다. GJC의 기존 부모 필드도 명시적 증거로 사용합니다.
+
+GJC·Codex에서 같은 세션의 부모 증거가 서로 충돌하면 해당 세션의 나가는 부모 연결만 제외하고 경고합니다. 충돌한 세션 자체와 그 세션을 가리키는 정상 자식의 사용량은 유지합니다. 제목 패치나 뒤늦은 단일 부모 기록으로 이미 수집한 충돌 증거를 덮어쓰지 않습니다.
 
 ### OpenCode 회계와 읽기 안전성
 
@@ -314,6 +325,8 @@ cargo test
 
 - Codex fixture 파싱과 index 기반 세션 이름 반영
 - GJC duplicate message 제거와 parent session 유지
+- GJC·Codex 다단계 roll-up, 무사용 부모, 고아·순환·부모 충돌과 일반 fork 제외
+- 루트 합산의 기간 필터·세부 토큰·모델·effort 보존 및 CLI·JSON·TUI 표시
 - malformed JSONL, 누락 필드, invalid timestamp, unknown reasoning effort, empty/missing directory
 - Codex cumulative stale/reset 처리
 - 기간 필터와 day/week/month grouping
@@ -327,6 +340,13 @@ cargo test
 
 - `.github/workflows/ci.yml`: PR/main push에서 fmt, clippy, test 실행
 - `.github/workflows/release.yml`: `v*` tag push 시 release archive와 `SHA256SUMS` 생성
+
+### 0.5.0 변경 사항
+
+- GJC·Codex 서브에이전트 사용량을 최상위 부모에 합산하고 CLI·JSON·TUI에 루트만 표시
+- 사용량 없는 부모와 기간 밖 계보 유지, 부모 충돌·고아·순환 진단
+- 전체 토큰·캐시·추론·모델·effort·날짜 배분 보존 및 OpenCode 기존 동작 유지
+- 소스 간 부모 충돌 격리·self-loop·고아와 실제 CLI·TUI 회귀 검증 추가
 
 ### 0.4.0 변경 사항
 

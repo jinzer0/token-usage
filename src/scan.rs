@@ -1,9 +1,32 @@
 use crate::{
     diagnostics::Diagnostic,
-    domain::{Client, UsageRecord},
+    domain::{Client, SessionKey, UsageRecord},
 };
 use serde::Serialize;
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
+
+#[derive(Clone, Debug)]
+pub struct SessionMetadata {
+    pub key: SessionKey,
+    pub parent_candidates: BTreeMap<SessionKey, (PathBuf, Option<u64>)>,
+    pub name: Option<String>,
+    pub source_path: PathBuf,
+    pub source_line: Option<u64>,
+}
+
+impl SessionMetadata {
+    pub fn add_parent(&mut self, key: SessionKey, path: PathBuf, line: Option<u64>) {
+        let location = (path, line);
+        self.parent_candidates
+            .entry(key)
+            .and_modify(|existing| {
+                if location < *existing {
+                    *existing = location.clone();
+                }
+            })
+            .or_insert(location);
+    }
+}
 
 #[derive(Default, Clone, Debug, Serialize)]
 pub struct ScanSummary {
@@ -37,6 +60,7 @@ pub struct SourceCounts {
 #[derive(Clone, Debug)]
 pub struct ParseResult {
     pub records: Vec<UsageRecord>,
+    pub session_metadata: Vec<SessionMetadata>,
     pub diagnostics: Vec<Diagnostic>,
     pub summary: ScanSummary,
 }
@@ -54,6 +78,7 @@ impl ParseResult {
         }
         Self {
             records: Vec::new(),
+            session_metadata: Vec::new(),
             diagnostics: Vec::new(),
             summary,
         }

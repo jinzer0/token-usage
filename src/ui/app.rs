@@ -634,6 +634,112 @@ mod tests {
             .collect()
     }
     #[test]
+    fn parsed_subagents_show_only_roots_in_both_tabs_search_and_refresh() {
+        use crate::{aggregate::aggregate, sources};
+        use serde_json::json;
+        for client in [Gjc, Codex] {
+            let dir = tempfile::tempdir().unwrap();
+            let logs = if client == Codex {
+                dir.path().join("sessions")
+            } else {
+                dir.path().to_path_buf()
+            };
+            std::fs::create_dir_all(&logs).unwrap();
+            let root = if client == Codex {
+                std::fs::write(
+                    dir.path().join("session_index.jsonl"),
+                    "{\"id\":\"root\",\"name\":\"Root title\"}\n",
+                )
+                .unwrap();
+                json!({"type":"session_meta","payload":{"id":"root"}})
+            } else {
+                json!({"type":"header","id":"root","title":"Root title"})
+            };
+            std::fs::write(logs.join("root.jsonl"), format!("{root}\n")).unwrap();
+            let snapshot = |extra: bool| {
+                let mut lines = if client == Codex {
+                    vec![
+                        json!({"type":"session_meta","payload":{"id":"child","parent_thread_id":"root"}}),
+                        json!({"type":"turn_context","payload":{"model":"child-model"}}),
+                    ]
+                } else {
+                    vec![
+                        json!({"type":"header","id":"child","parent_session_id":"root","title":"Child title"}),
+                    ]
+                };
+                for (index, (timestamp, total)) in
+                    [("2026-03-10T12:00:00Z", 11), ("2026-03-11T12:00:00Z", 17)]
+                        .into_iter()
+                        .enumerate()
+                {
+                    if index == 1 && !extra {
+                        continue;
+                    }
+                    lines.push(if client == Codex {
+                        json!({"type":"event_msg","timestamp":timestamp,"payload":{"type":"token_count","info":{
+                            "total_token_usage":{"total_tokens":if index == 0 { 11 } else { 28 }},
+                            "last_token_usage":{"input_tokens":total-1,"output_tokens":1,"total_tokens":total}}}})
+                    } else {
+                        json!({"type":"message","id":format!("m{index}"),"timestamp":timestamp,
+                            "message":{"role":"assistant","model":"child-model","usage":{"input":total-1,"output":1,"totalTokens":total}}})
+                    });
+                }
+                std::fs::write(
+                    logs.join("child.jsonl"),
+                    lines.iter().map(|v| format!("{v}\n")).collect::<String>(),
+                )
+                .unwrap();
+                let parsed = if client == Codex {
+                    sources::codex::parse(dir.path())
+                } else {
+                    sources::gjc::parse(dir.path())
+                }
+                .unwrap();
+                aggregate(vec![parsed]).unwrap()
+            };
+            let mut app = App::new(snapshot(false));
+            assert_eq!(ids(&app), ["root"]);
+            assert_eq!(
+                app.selected_session().unwrap().name.as_deref(),
+                Some("Root title")
+            );
+            assert_eq!(app.selected_session().unwrap().tokens.total_tokens, 11);
+            app.switch_tab(ViewTab::Dates);
+            assert_eq!(ids(&app), ["root"]);
+            let selected_date = app.selected_date;
+            let selected_key = app.selected_session.clone();
+            app.replace_snapshot(snapshot(true));
+            assert_eq!(app.selected_date, selected_date);
+            assert_eq!(app.selected_session, selected_key);
+            assert_eq!(
+                app.selected_tokens(app.selected_index().unwrap())
+                    .unwrap()
+                    .total_tokens,
+                11
+            );
+            app.switch_tab(ViewTab::Sessions);
+            assert_eq!(ids(&app), ["root"]);
+            assert_eq!(app.selected_session().unwrap().tokens.total_tokens, 28);
+            assert_eq!(
+                app.selected_session().unwrap().last_used_at,
+                Some("2026-03-11T12:00:00Z".parse().unwrap())
+            );
+            app.start_search();
+            for c in "child".chars() {
+                app.push_search_char(c);
+            }
+            app.confirm_search();
+            assert!(app.filtered_sessions.is_empty());
+            app.cancel_search();
+            app.start_search();
+            for c in "root title".chars() {
+                app.push_search_char(c);
+            }
+            app.confirm_search();
+            assert_eq!(ids(&app), ["root"]);
+        }
+    }
+    #[test]
     fn precise_last_used_unknown_and_id_client_ties_do_not_change_cli_order() {
         let snapshot = test_snapshot(&[
             ("late", Gjc, Some("2026-03-11T12:00:00.002Z"), 0, true),

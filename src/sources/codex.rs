@@ -1,13 +1,13 @@
 use crate::{
     diagnostics::Diagnostic,
     domain::{Client, MessageId, ReasoningEffort, SessionId, SessionKey, TokenStats, UsageRecord},
-    scan::{ParseResult, ScanSummary},
+    scan::{ParseResult, ScanSummary, SessionMetadata},
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs::File,
     io::{BufRead, BufReader},
     path::Path,
@@ -23,6 +23,7 @@ pub fn parse(root: &Path) -> Result<ParseResult> {
         summary.missing_roots.push(root.to_path_buf());
         return Ok(ParseResult {
             records: vec![],
+            session_metadata: vec![],
             diagnostics: vec![],
             summary,
         });
@@ -34,11 +35,13 @@ pub fn parse(root: &Path) -> Result<ParseResult> {
         summary.empty_roots.push(root.to_path_buf());
         return Ok(ParseResult {
             records: vec![],
+            session_metadata: vec![],
             diagnostics: vec![],
             summary,
         });
     }
     let mut records = Vec::new();
+    let mut session_metadata = Vec::new();
     let mut diagnostics = Vec::new();
     let mut files = 0;
     for entry in WalkDir::new(&sessions)
@@ -54,6 +57,7 @@ pub fn parse(root: &Path) -> Result<ParseResult> {
             entry.path(),
             &names,
             &mut records,
+            &mut session_metadata,
             &mut diagnostics,
             &mut summary,
         )?;
@@ -63,6 +67,7 @@ pub fn parse(root: &Path) -> Result<ParseResult> {
     }
     Ok(ParseResult {
         records,
+        session_metadata,
         diagnostics,
         summary,
     })
@@ -92,6 +97,7 @@ fn parse_file(
     path: &Path,
     names: &HashMap<String, String>,
     records: &mut Vec<UsageRecord>,
+    session_metadata: &mut Vec<SessionMetadata>,
     diagnostics: &mut Vec<Diagnostic>,
     summary: &mut ScanSummary,
 ) -> Result<()> {
@@ -106,6 +112,7 @@ fn parse_file(
     let mut model = None;
     let mut effort = None;
     let mut previous_total = None::<u64>;
+    let mut metadata = BTreeMap::<SessionKey, SessionMetadata>::new();
     for (idx, line) in BufReader::new(file).lines().enumerate() {
         let line_no = idx as u64 + 1;
         summary.lines_read += 1;
@@ -126,9 +133,45 @@ fn parse_file(
         };
         let payload = v.get("payload");
         if v.get("type").and_then(Value::as_str) == Some("session_meta")
-            && let Some(id) = payload.and_then(|p| string_at(p, &["id"]))
+            && let Some(id) = payload
+                .and_then(|p| p.get("id"))
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
         {
-            session_id = id;
+            session_id = id.to_string();
+            let key = SessionKey {
+                client: Client::Codex,
+                id: SessionId(session_id.clone()),
+            };
+            let entry = metadata
+                .entry(key.clone())
+                .or_insert_with(|| SessionMetadata {
+                    key,
+                    parent_candidates: BTreeMap::new(),
+                    name: names.get(&session_id).cloned(),
+                    source_path: path.to_path_buf(),
+                    source_line: Some(line_no),
+                });
+            if let Some(payload) = payload {
+                for parent in [
+                    payload.get("parent_thread_id"),
+                    payload.pointer("/source/subagent/thread_spawn/parent_thread_id"),
+                ] {
+                    if let Some(parent) = parent
+                        .and_then(Value::as_str)
+                        .filter(|p| !p.trim().is_empty())
+                    {
+                        entry.add_parent(
+                            SessionKey {
+                                client: Client::Codex,
+                                id: SessionId(parent.to_string()),
+                            },
+                            path.to_path_buf(),
+                            Some(line_no),
+                        );
+                    }
+                }
+            }
         }
         let context = if v.get("type").and_then(Value::as_str) == Some("turn_context") {
             payload
@@ -282,6 +325,7 @@ fn parse_file(
         });
         summary.records_emitted += 1;
     }
+    session_metadata.extend(metadata.into_values());
     Ok(())
 }
 
@@ -361,6 +405,57 @@ pub(crate) fn token_stats(v: &Value) -> Result<TokenStats> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn metadata_uses_official_parents_not_fork_or_shared_session_id() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("sessions")).unwrap();
+        std::fs::write(
+            root.path().join("session_index.jsonl"),
+            "{\"id\":\"child\",\"name\":\"Indexed\"}\n{\"id\":\"index-only\",\"name\":\"Absent\"}",
+        )
+        .unwrap();
+        let values = [
+            json!({"type":"session_meta","payload":{"id":"child","session_id":"shared","forked_from_id":"fork","parent_thread_id":"direct","source":{"subagent":{"thread_spawn":{"parent_thread_id":"official"}}}}}),
+            json!({"type":"session_meta","payload":{"id":"child","parent_thread_id":null}}),
+            json!({"type":"session_meta","payload":{"id":"fork-only","session_id":"shared","forked_from_id":"fork","parent_thread_id":42}}),
+        ];
+        std::fs::write(
+            root.path().join("sessions/rollout-test.jsonl"),
+            values
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let result = parse(root.path()).unwrap();
+        assert!(result.records.is_empty());
+        assert_eq!(result.session_metadata.len(), 2);
+        let child = result
+            .session_metadata
+            .iter()
+            .find(|m| m.key.id.0 == "child")
+            .unwrap();
+        assert_eq!(child.name.as_deref(), Some("Indexed"));
+        assert_eq!(
+            child
+                .parent_candidates
+                .keys()
+                .map(|k| k.id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["direct", "official"]
+        );
+        assert!(
+            result
+                .session_metadata
+                .iter()
+                .find(|m| m.key.id.0 == "fork-only")
+                .unwrap()
+                .parent_candidates
+                .is_empty()
+        );
+    }
 
     #[test]
     fn cumulative_total_only_is_unknown_reasoning_not_known_zero() {

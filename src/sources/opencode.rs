@@ -72,6 +72,7 @@ pub fn parse(path: &Path) -> Result<ParseResult> {
     reject_memory(path)?;
     let mut result = ParseResult {
         records: Vec::new(),
+        session_metadata: Vec::new(),
         diagnostics: Vec::new(),
         summary: ScanSummary {
             client: Some(Client::OpenCode),
