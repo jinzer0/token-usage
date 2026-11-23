@@ -42,7 +42,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
                     Client::OpenCode => theme.client_opencode(),
                 }
             };
-            let total = format::token_count(app.selected_tokens(*idx)?.total_tokens);
+            let total = format::token_count(app.display_session_tokens(*idx)?.total_tokens);
             let total_width = format::display_width(&total).max(5);
             let total_padded = format::pad_left(&total, total_width);
 

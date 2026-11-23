@@ -1,5 +1,7 @@
 use crate::{
-    aggregate::{AggregateSnapshot, DateStats, EffortStats, SessionDayStats, SessionStats},
+    aggregate::{
+        AggregateSnapshot, DateStats, EffortStats, ModelStats, SessionDayStats, SessionStats,
+    },
     domain::{Client, ReasoningEffort, SessionKey, TokenStats},
 };
 use chrono::{Duration, Local, NaiveDate};
@@ -314,6 +316,112 @@ impl App {
             }
             ViewTab::Dates => self.selected_day_stats(session_index).map(|d| &d.tokens),
         }
+    }
+    pub fn display_session_tokens(&self, session_index: usize) -> Option<TokenStats> {
+        match self.tab {
+            ViewTab::Sessions | ViewTab::Models => self.filtered_session_tokens(session_index),
+            ViewTab::Dates => self
+                .selected_day_stats(session_index)
+                .map(|d| d.tokens.clone()),
+        }
+    }
+    pub fn filtered_session_detail(
+        &self,
+        session_index: usize,
+    ) -> Option<(TokenStats, Vec<ModelStats>, u64)> {
+        let today = Local::now().date_naive();
+        self.filtered_session_detail_on(session_index, today)
+    }
+    fn filtered_session_detail_on(
+        &self,
+        session_index: usize,
+        today: NaiveDate,
+    ) -> Option<(TokenStats, Vec<ModelStats>, u64)> {
+        let session = self.snapshot.sessions.get(session_index)?;
+        if self.period_filter == PeriodFilter::All {
+            return Some((
+                session.tokens.clone(),
+                session.models.clone(),
+                session.record_count,
+            ));
+        }
+        let mut total_tokens = TokenStats::default();
+        let mut total_records = 0u64;
+        type EffortMap = BTreeMap<Option<ReasoningEffort>, (TokenStats, u64)>;
+        let mut by_model: BTreeMap<String, (TokenStats, u64, EffortMap)> = BTreeMap::new();
+        for bucket in &session.daily {
+            if bucket.record_count == 0 || !self.period_filter.matches_day(bucket.day, today) {
+                continue;
+            }
+            add_tokens(&mut total_tokens, &bucket.tokens);
+            total_records = total_records.saturating_add(bucket.record_count);
+            for model in &bucket.models {
+                let entry = by_model.entry(model.model.clone()).or_default();
+                add_tokens(&mut entry.0, &model.tokens);
+                entry.1 = entry.1.saturating_add(model.record_count);
+                for effort in &model.efforts {
+                    let eff = entry.2.entry(effort.effort.clone()).or_default();
+                    add_tokens(&mut eff.0, &effort.tokens);
+                    eff.1 = eff.1.saturating_add(effort.record_count);
+                }
+            }
+        }
+        if total_records == 0 {
+            return None;
+        }
+        let mut models: Vec<ModelStats> = by_model
+            .into_iter()
+            .map(|(model, (tokens, record_count, efforts_map))| {
+                let mut efforts: Vec<EffortStats> = efforts_map
+                    .into_iter()
+                    .map(|(effort, (et, ec))| EffortStats {
+                        effort,
+                        tokens: et,
+                        record_count: ec,
+                    })
+                    .collect();
+                efforts.sort_by(|a, b| {
+                    b.tokens
+                        .total_tokens
+                        .cmp(&a.tokens.total_tokens)
+                        .then_with(|| a.effort.cmp(&b.effort))
+                });
+                ModelStats {
+                    model,
+                    tokens,
+                    efforts,
+                    record_count,
+                }
+            })
+            .collect();
+        models.sort_by(|a, b| {
+            b.tokens
+                .total_tokens
+                .cmp(&a.tokens.total_tokens)
+                .then_with(|| a.model.cmp(&b.model))
+        });
+        Some((total_tokens, models, total_records))
+    }
+    pub fn client_date_tokens(&self, date_index: usize) -> Option<TokenStats> {
+        let date = self.snapshot.dates.get(date_index)?;
+        if self.client_filter == ClientScope::All {
+            return Some(date.tokens.clone());
+        }
+        let mut sum = TokenStats::default();
+        let mut records = 0u64;
+        for item in &date.sessions {
+            let session = self.snapshot.sessions.get(item.session_index)?;
+            if !self.client_filter.matches(session.key.client) {
+                continue;
+            }
+            if let Some(bucket) = session.daily.get(item.day_index)
+                && bucket.record_count > 0
+            {
+                add_tokens(&mut sum, &bucket.tokens);
+                records = records.saturating_add(bucket.record_count);
+            }
+        }
+        (records > 0).then_some(sum)
     }
     pub fn filtered_session_tokens(&self, session_index: usize) -> Option<TokenStats> {
         let today = Local::now().date_naive();

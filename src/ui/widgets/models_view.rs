@@ -234,19 +234,36 @@ fn render_model_detail(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: 
     );
     let total_lines = wrapped_line_count(&lines, inner_width as usize);
     app.set_detail_metrics(total_lines, viewport_height);
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(if app.focus == PaneFocus::Details {
+            theme.border_focused()
+        } else {
+            theme.border()
+        })
+        .title(title);
+    if viewport_height > 0 && total_lines > viewport_height {
+        let start = (app.detail_scroll + 1).min(total_lines);
+        let end = app
+            .detail_scroll
+            .saturating_add(viewport_height)
+            .min(total_lines);
+        let arrow = match (app.detail_scroll > 0, end < total_lines) {
+            (true, true) => " ↕",
+            (false, true) => " ↓",
+            (true, false) => " ↑",
+            (false, false) => "",
+        };
+        block = block.title_bottom(
+            Line::from(format!(" L{start}-{end}/{total_lines}{arrow} "))
+                .right_aligned()
+                .style(theme.muted_text()),
+        );
+    }
     let paragraph = Paragraph::new(lines)
         .scroll((app.detail_scroll.min(u16::MAX as usize) as u16, 0))
         .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(if app.focus == PaneFocus::Details {
-                    theme.border_focused()
-                } else {
-                    theme.border()
-                })
-                .title(title),
-        );
+        .block(block);
     frame.render_widget(paragraph, area);
 }
 
@@ -300,7 +317,8 @@ fn model_detail_lines(
             .input_uncached
             .saturating_add(row.tokens.cache_read),
     );
-    let cache_hit = format::percentage(row.tokens.cache_read, cache_denom);
+    let cache_hit =
+        format::cache_hit_rate(row.tokens.cache_read, cache_denom).unwrap_or_else(|| "0%".into());
     lines.push(Line::styled(
         format!("Cache hit rate {cache_hit}"),
         theme.primary_text(),

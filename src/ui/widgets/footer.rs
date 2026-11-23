@@ -33,7 +33,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, _mode
             Span::styled(
                 format::truncate_ellipsis(
                     notice,
-                    area.width.saturating_sub(hints_text.len() as u16 + 1) as usize,
+                    area.width
+                        .saturating_sub(format::display_width(hints_text) as u16 + 1)
+                        as usize,
                 ),
                 theme.muted_text(),
             ),

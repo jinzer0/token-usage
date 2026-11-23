@@ -110,7 +110,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
         )]
     };
     if app.tab == ViewTab::Dates {
-        if let Some(date) = app.selected_date_stats() {
+        if let Some(pos) = app.selected_date_position()
+            && let Some(date_index) = app.visible_dates.get(pos).copied()
+            && let Some(date_tokens) = app.client_date_tokens(date_index)
+        {
             let scope = app
                 .selected_date
                 .map(|scope| scope.label())
@@ -118,12 +121,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
             summary.push(Span::styled(
                 format!(
                     "   {scope} · all {}",
-                    format::token_count(date.tokens.total_tokens)
+                    format::token_count(date_tokens.total_tokens)
                 ),
                 theme.muted_text(),
             ));
         }
-    } else if area.width >= 110 {
+    } else if area.width >= 110 && !filtered {
         summary.push(Span::styled(
             format!(
                 "   today {} · 7d {} · 30d {}",

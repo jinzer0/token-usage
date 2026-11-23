@@ -44,10 +44,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme, m
         return;
     }
 
-    let Some(session) = app.selected_session() else {
+    let Some(session_idx) = app.selected_index() else {
         app.set_detail_metrics(0, viewport_height);
         frame.render_widget(
-            Paragraph::new("No matching sessions. Press Esc to clear search.").block(
+            Paragraph::new(
+                "No matching sessions. Press Esc to clear search or c/f to reset filters.",
+            )
+            .wrap(Wrap { trim: false })
+            .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(border_style),
@@ -56,6 +60,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme, m
         );
         return;
     };
+    let session = &app.snapshot.sessions[session_idx];
 
     let raw_title = session.name.as_deref().unwrap_or(&session.key.id.0);
     let max_title_width = area.width.saturating_sub(4) as usize;
@@ -79,14 +84,34 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme, m
     };
 
     let inner_width = area.width.saturating_sub(2);
-    let lines = detail_lines(
-        session,
-        app.detail_scope,
-        theme,
-        app.breakdown,
-        mode,
-        inner_width as usize,
-    );
+    let scoped_all = if app.detail_scope == DetailScope::All
+        && app.period_filter != crate::ui::app::PeriodFilter::All
+    {
+        app.filtered_session_detail(session_idx)
+    } else {
+        None
+    };
+    let lines = match &scoped_all {
+        Some((tokens, models, record_count)) => detail_lines_with_data(
+            session,
+            app.period_filter.label().to_string(),
+            tokens,
+            models.as_slice(),
+            *record_count,
+            theme,
+            app.breakdown,
+            mode,
+            inner_width as usize,
+        ),
+        None => detail_lines(
+            session,
+            app.detail_scope,
+            theme,
+            app.breakdown,
+            mode,
+            inner_width as usize,
+        ),
+    };
     let total_lines = wrapped_line_count(&lines, inner_width as usize);
     app.set_detail_metrics(total_lines, viewport_height);
     let paragraph = Paragraph::new(lines)
@@ -154,6 +179,31 @@ fn detail_lines(
         }
     };
 
+    detail_lines_with_data(
+        session,
+        scope.label(),
+        tokens,
+        models,
+        record_count,
+        theme,
+        breakdown,
+        mode,
+        width,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn detail_lines_with_data(
+    session: &SessionStats,
+    scope_label: String,
+    tokens: &TokenStats,
+    models: &[ModelStats],
+    record_count: u64,
+    theme: &Theme,
+    breakdown: bool,
+    mode: LayoutMode,
+    width: usize,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let client = match session.key.client {
         Client::Codex => "CODEX",
@@ -185,7 +235,7 @@ fn detail_lines(
         format!("{record_count} records")
     };
     lines.push(Line::styled(
-        format!("{} · {rec_label}", scope.label()),
+        format!("{scope_label} · {rec_label}"),
         theme.muted_text(),
     ));
 

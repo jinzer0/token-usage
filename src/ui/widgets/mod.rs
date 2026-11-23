@@ -360,10 +360,53 @@ mod tests {
         app.detail_scroll = 9999;
         draw(&mut app, 120, 16);
         assert_eq!(app.detail_scroll, app.detail_max_scroll);
+        let overflow_text = screen(&draw(&mut app, 120, 14));
+        assert!(overflow_text.contains("L"), "missing scroll indicator");
 
         // Select second model and verify detail updates
         app.select_model_at(1);
         let text = screen(&draw(&mut app, 120, 30));
         assert!(text.contains("Total 300 (300)"));
+    }
+
+    #[test]
+    fn period_filter_scopes_session_list_and_session_detail_in_sessions_tab() {
+        let now = chrono::Utc::now();
+        let old = now - chrono::Duration::days(45);
+        let mut result = ParseResult::empty(Client::Gjc, "period-scope".into());
+        for (at, model, total) in [(old, "ancient-model", 9000), (now, "today-model", 250)] {
+            result.records.push(UsageRecord {
+                session_key: SessionKey {
+                    client: Client::Gjc,
+                    id: SessionId("scoped-session".into()),
+                },
+                parent_session_key: None,
+                message_id: None,
+                source_path: "period-scope".into(),
+                source_line: None,
+                started_at: Some(at),
+                session_name: Some("Scoped".into()),
+                model: model.into(),
+                reasoning_effort: None,
+                tokens: TokenStats {
+                    total_tokens: total,
+                    ..Default::default()
+                },
+            });
+        }
+        let mut app = App::new(aggregate(vec![result]).unwrap());
+        let all_text = screen(&draw(&mut app, 120, 24));
+        assert!(all_text.contains("Total 9250"));
+        assert!(all_text.contains("ancient-model") && all_text.contains("today-model"));
+
+        app.cycle_period_filter(); // Today
+        let today_text = screen(&draw(&mut app, 120, 24));
+        assert!(
+            today_text.contains("Total 250"),
+            "today detail: {today_text}"
+        );
+        assert!(today_text.contains("today-model"));
+        assert!(!today_text.contains("ancient-model"));
+        assert!(!today_text.contains("9.2K"));
     }
 }

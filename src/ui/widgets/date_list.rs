@@ -104,8 +104,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
             }
 
             if pinned {
+                let all_total = app
+                    .client_date_tokens(*index)
+                    .map(|t| t.total_tokens)
+                    .unwrap_or(date.tokens.total_tokens);
                 lines.push(Line::styled(
-                    format!("  all {}", format::token_count(date.tokens.total_tokens)),
+                    format!("  all {}", format::token_count(all_total)),
                     if selected && focused {
                         focused_row_style
                     } else {
