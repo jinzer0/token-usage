@@ -143,6 +143,32 @@ pub fn cache_hit_rate(cache_read: u64, input_total: u64) -> Option<String> {
     }
 }
 
+#[allow(dead_code)]
+pub fn shorten_home(path: &str) -> String {
+    let home = dirs::home_dir();
+    shorten_home_with(path, home.as_deref().and_then(|p| p.to_str()))
+}
+
+#[allow(dead_code)]
+fn shorten_home_with(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home else {
+        return path.to_string();
+    };
+    let home = home.trim_end_matches(['/', '\\']);
+    if home.is_empty() {
+        return path.to_string();
+    }
+    if path == home {
+        return "~".to_string();
+    }
+    if let Some(rest) = path.strip_prefix(home)
+        && (rest.starts_with('/') || rest.starts_with('\\'))
+    {
+        return format!("~{rest}");
+    }
+    path.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +282,35 @@ mod tests {
         assert_eq!(usage_bar(50, 100, 10), "█████░░░░░");
         assert_eq!(usage_bar(0, 100, 4), "░░░░");
         assert_eq!(usage_bar(1, 1, 3), "███");
+    }
+
+    #[test]
+    fn shortens_home_paths_safely() {
+        assert_eq!(shorten_home_with("/Users/alice", Some("/Users/alice")), "~");
+        assert_eq!(
+            shorten_home_with("/Users/alice/work/repo", Some("/Users/alice")),
+            "~/work/repo"
+        );
+        assert_eq!(
+            shorten_home_with("/Users/alice2/work", Some("/Users/alice")),
+            "/Users/alice2/work"
+        );
+        assert_eq!(
+            shorten_home_with("/Users/alice/work", Some("/Users/alice/")),
+            "~/work"
+        );
+        assert_eq!(
+            shorten_home_with("/Users/alice", Some("/Users/alice/")),
+            "~"
+        );
+        assert_eq!(
+            shorten_home_with(r"C:\Users\alice\work", Some(r"C:\Users\alice")),
+            r"~\work"
+        );
+        assert_eq!(
+            shorten_home_with("/Users/alice/work", None),
+            "/Users/alice/work"
+        );
+        assert_eq!(shorten_home_with("/work", Some("/")), "/work");
     }
 }

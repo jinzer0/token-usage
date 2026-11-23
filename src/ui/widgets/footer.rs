@@ -12,7 +12,15 @@ use ratatui::{
 };
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, _mode: LayoutMode) {
-    let line = if app.search.mode == SearchMode::Editing {
+    let line = if app.period_input.editing {
+        let mut spans = vec![
+            Span::styled(" Days (N): ", theme.hint_key()),
+            Span::styled(app.period_input.query.clone(), theme.primary_text()),
+            Span::raw("  "),
+        ];
+        push_hints(&mut spans, &[("Enter", "apply"), ("Esc", "cancel")], theme);
+        Line::from(spans)
+    } else if app.search.mode == SearchMode::Editing {
         let mut spans = vec![
             Span::styled(" Search: ", theme.hint_key()),
             Span::styled(app.search.query.clone(), theme.primary_text()),
@@ -66,6 +74,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, _mode
                     ("s", "sort"),
                     ("c", "client"),
                     ("f", "period"),
+                    ("n", "Nd"),
                     ("/", "search"),
                     ("v", "breakdown"),
                     ("r", "reload"),
@@ -79,7 +88,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, _mode
                     ("jk", "move"),
                     ("[/]", "dates"),
                     ("s", "sort"),
-                    ("c/f", "filter"),
+                    ("c/f/n", "filter"),
                     ("d/p", "pin"),
                     ("/", "search"),
                     ("v", "detail"),
@@ -93,7 +102,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, _mode
                     ("jk", "session"),
                     ("d", "dates"),
                     ("s", "sort"),
-                    ("c/f", "filter"),
+                    ("c/f/n", "filter"),
                     ("/", "search"),
                     ("v", "breakdown"),
                     ("r", "reload"),
@@ -105,8 +114,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, _mode
                     ("1-3", "tabs"),
                     ("jk", "move"),
                     ("s", "sort"),
-                    ("c/f", "filter"),
-                    ("v", "breakdown"),
+                    ("c/f/n", "filter"),
+                    ("v", "detail"),
                     ("r", "reload"),
                     ("?", "help"),
                     ("q", "quit"),
@@ -115,7 +124,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, _mode
                 &[
                     ("jk", ""),
                     ("d", "dates"),
-                    ("c/f", "filter"),
+                    ("c/f/n", "filter"),
                     ("?", "help"),
                     ("q", ""),
                 ]
@@ -173,5 +182,30 @@ mod tests {
         let q_col = row[..byte_pos].chars().count() as u16;
         assert_eq!(buf[(q_col, 0)].fg, Color::Yellow);
         assert_eq!(buf[(q_col + 2, 0)].fg, Color::Gray);
+    }
+
+    #[test]
+    fn period_input_editing_renders_days_prompt_and_hints() {
+        let mut app = App::new(crate::ui::app::daily_test_snapshot([true; 3]));
+        app.start_period_input();
+        app.push_period_digit('1');
+        app.push_period_digit('4');
+        let mut terminal = Terminal::new(TestBackend::new(80, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    frame.area(),
+                    &app,
+                    &Theme::default(),
+                    LayoutMode::Wide,
+                )
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let row: String = (0..80).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(row.contains("Days (N): 14"), "row: {row}");
+        assert!(row.contains("Enter apply"), "row: {row}");
+        assert!(row.contains("Esc cancel"), "row: {row}");
     }
 }
