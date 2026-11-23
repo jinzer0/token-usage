@@ -700,6 +700,7 @@ fn daily_record(
         source_line: None,
         started_at: timestamp,
         session_name: Some("Daily fixture".into()),
+        workspace: None,
         model: model.into(),
         reasoning_effort: effort,
         tokens,
@@ -1465,7 +1466,7 @@ fn daily_session_three_sources_root_identity_partition_and_json_shape() {
         .iter()
         .zip(&snapshot.sessions)
     {
-        assert_eq!(value.as_object().unwrap().len(), 8);
+        assert_eq!(value.as_object().unwrap().len(), 9);
         assert!(value.get("daily").is_none());
         assert_eq!(value["key"], serde_json::to_value(&session.key).unwrap());
         assert_eq!(
@@ -1473,6 +1474,10 @@ fn daily_session_three_sources_root_identity_partition_and_json_shape() {
             serde_json::to_value(&session.parent).unwrap()
         );
         assert_eq!(value["name"], serde_json::to_value(&session.name).unwrap());
+        assert_eq!(
+            value["workspace"],
+            serde_json::to_value(&session.workspace).unwrap()
+        );
         assert_eq!(
             value["started_at"],
             serde_json::to_value(session.started_at).unwrap()
@@ -1724,4 +1729,181 @@ fn daily_session_fixed_instants_local_midnight_and_dst() {
         );
     }
     daily_assert_partition(session);
+}
+
+#[test]
+fn cli_tui_rejects_unknown_session_selector_before_starting_tui() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join("session.jsonl"),
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"session","id":"alpha","title":"Alpha Session"}),
+            serde_json::json!({
+                "type":"message","id":"m1","timestamp":"2026-09-01T12:00:00Z",
+                "message":{"role":"assistant","model":"m","usage":{"input":10,"output":5,"totalTokens":15}}
+            }),
+        ),
+    )
+    .unwrap();
+
+    assert_cmd::Command::cargo_bin("token-usage")
+        .unwrap()
+        .args(["--client", "gjc", "--gjc-home"])
+        .arg(dir.path())
+        .args(["--tui", "nonexistent-session"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("session not found"));
+}
+
+#[test]
+fn cli_group_by_with_session_scopes_timeline_and_rejects_unknown_session() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join("alpha.jsonl"),
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"session","id":"alpha","title":"Alpha Session"}),
+            serde_json::json!({
+                "type":"message","id":"a1","timestamp":"2026-09-01T12:00:00Z",
+                "message":{"role":"assistant","model":"m","usage":{"input":100,"output":25,"totalTokens":125}}
+            }),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("beta.jsonl"),
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"session","id":"beta","title":"Beta Session"}),
+            serde_json::json!({
+                "type":"message","id":"b1","timestamp":"2026-09-02T12:00:00Z",
+                "message":{"role":"assistant","model":"m","usage":{"input":400,"output":50,"totalTokens":450}}
+            }),
+        ),
+    )
+    .unwrap();
+
+    let output = assert_cmd::Command::cargo_bin("token-usage")
+        .unwrap()
+        .args(["--client", "gjc", "--gjc-home"])
+        .arg(dir.path())
+        .args(["--group-by", "day", "gjc:alpha"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(stdout.contains("2026-09-01"), "stdout:\n{stdout}");
+    assert!(stdout.contains("125"), "stdout:\n{stdout}");
+    assert!(!stdout.contains("2026-09-02"), "stdout:\n{stdout}");
+    assert!(!stdout.contains("450"), "stdout:\n{stdout}");
+
+    assert_cmd::Command::cargo_bin("token-usage")
+        .unwrap()
+        .args(["--client", "gjc", "--gjc-home"])
+        .arg(dir.path())
+        .args(["--group-by", "day", "missing-session"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("session not found"));
+}
+
+#[test]
+fn cli_json_and_detail_include_workspace_for_codex_and_gjc() {
+    use serde_json::json;
+    let dir = tempdir().unwrap();
+
+    let codex_home = dir.path().join("codex");
+    let codex_sessions = codex_home.join("sessions");
+    fs::create_dir_all(&codex_sessions).unwrap();
+    fs::write(
+        codex_sessions.join("root.jsonl"),
+        format!(
+            "{}\n{}\n",
+            json!({"type":"session_meta","payload":{"id":"codex-root","cwd":"/work/codex-app"}}),
+            json!({"type":"turn_context","payload":{"model":"gpt-5"}}),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        codex_sessions.join("child.jsonl"),
+        format!(
+            "{}\n{}\n{}\n",
+            json!({"type":"session_meta","payload":{"id":"codex-child","parent_thread_id":"codex-root","cwd":"/work/codex-child"}}),
+            json!({"type":"turn_context","payload":{"model":"gpt-5"}}),
+            json!({"type":"event_msg","timestamp":"2026-09-01T12:00:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}}),
+        ),
+    )
+    .unwrap();
+
+    let gjc_home = dir.path().join("gjc");
+    fs::create_dir_all(&gjc_home).unwrap();
+    fs::write(
+        gjc_home.join("root.jsonl"),
+        format!(
+            "{}\n",
+            json!({"type":"header","id":"gjc-root","title":"GJC Root","cwd":"/work/gjc-app"}),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        gjc_home.join("child.jsonl"),
+        format!(
+            "{}\n{}\n",
+            json!({"type":"header","id":"gjc-child","parent_session_id":"gjc-root","cwd":"/work/gjc-child"}),
+            json!({"type":"message","id":"m1","timestamp":"2026-09-01T12:00:00Z","message":{"role":"assistant","model":"claude","usage":{"input":10,"output":5,"totalTokens":15}}}),
+        ),
+    )
+    .unwrap();
+
+    let json_output = assert_cmd::Command::cargo_bin("token-usage")
+        .unwrap()
+        .args(["--client", "all", "--codex-home"])
+        .arg(&codex_home)
+        .arg("--gjc-home")
+        .arg(&gjc_home)
+        .arg("--opencode-db")
+        .arg(dir.path().join("absent.db"))
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&json_output).unwrap();
+    let sessions = json["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 2);
+    let codex_session = sessions
+        .iter()
+        .find(|s| s["key"]["client"] == "codex")
+        .unwrap();
+    assert_eq!(codex_session["key"]["id"], "codex-root");
+    assert_eq!(codex_session["workspace"], "/work/codex-app");
+    let gjc_session = sessions
+        .iter()
+        .find(|s| s["key"]["client"] == "gjc")
+        .unwrap();
+    assert_eq!(gjc_session["key"]["id"], "gjc-root");
+    assert_eq!(gjc_session["workspace"], "/work/gjc-app");
+
+    assert_cmd::Command::cargo_bin("token-usage")
+        .unwrap()
+        .args(["--client", "codex", "--codex-home"])
+        .arg(&codex_home)
+        .arg("codex:codex-root")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("workspace /work/codex-app"));
+
+    assert_cmd::Command::cargo_bin("token-usage")
+        .unwrap()
+        .args(["--client", "gjc", "--gjc-home"])
+        .arg(&gjc_home)
+        .arg("gjc:gjc-root")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("workspace /work/gjc-app"));
 }

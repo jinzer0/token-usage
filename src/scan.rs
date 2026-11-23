@@ -10,6 +10,7 @@ pub struct SessionMetadata {
     pub key: SessionKey,
     pub parent_candidates: BTreeMap<SessionKey, (PathBuf, Option<u64>)>,
     pub name: Option<String>,
+    pub workspace: Option<String>,
     pub source_path: PathBuf,
     pub source_line: Option<u64>,
 }

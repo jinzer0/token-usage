@@ -111,6 +111,7 @@ fn parse_file(
         .to_string();
     let mut model = None;
     let mut effort = None;
+    let mut workspace = None::<String>;
     let mut previous_total = None::<u64>;
     let mut metadata = BTreeMap::<SessionKey, SessionMetadata>::new();
     for (idx, line) in BufReader::new(file).lines().enumerate() {
@@ -133,26 +134,33 @@ fn parse_file(
         };
         let payload = v.get("payload");
         if v.get("type").and_then(Value::as_str) == Some("session_meta")
-            && let Some(id) = payload
-                .and_then(|p| p.get("id"))
+            && let Some(payload) = payload
+        {
+            let extracted_workspace = extract_workspace(payload);
+            if let Some(id) = payload
+                .get("id")
                 .and_then(Value::as_str)
                 .filter(|id| !id.trim().is_empty())
-        {
-            session_id = id.to_string();
-            let key = SessionKey {
-                client: Client::Codex,
-                id: SessionId(session_id.clone()),
-            };
-            let entry = metadata
-                .entry(key.clone())
-                .or_insert_with(|| SessionMetadata {
-                    key,
-                    parent_candidates: BTreeMap::new(),
-                    name: names.get(&session_id).cloned(),
-                    source_path: path.to_path_buf(),
-                    source_line: Some(line_no),
-                });
-            if let Some(payload) = payload {
+            {
+                session_id = id.to_string();
+                let key = SessionKey {
+                    client: Client::Codex,
+                    id: SessionId(session_id.clone()),
+                };
+                let entry = metadata
+                    .entry(key.clone())
+                    .or_insert_with(|| SessionMetadata {
+                        key,
+                        parent_candidates: BTreeMap::new(),
+                        name: names.get(&session_id).cloned(),
+                        workspace: None,
+                        source_path: path.to_path_buf(),
+                        source_line: Some(line_no),
+                    });
+                if entry.workspace.is_none() {
+                    entry.workspace = extracted_workspace;
+                }
+                workspace = entry.workspace.clone();
                 for parent in [
                     payload.get("parent_thread_id"),
                     payload.pointer("/source/subagent/thread_spawn/parent_thread_id"),
@@ -171,6 +179,8 @@ fn parse_file(
                         );
                     }
                 }
+            } else if workspace.is_none() {
+                workspace = extracted_workspace;
             }
         }
         let context = if v.get("type").and_then(Value::as_str) == Some("turn_context") {
@@ -319,6 +329,7 @@ fn parse_file(
             source_line: Some(line_no),
             started_at: timestamp,
             session_name: names.get(&session_id).cloned(),
+            workspace: workspace.clone(),
             model,
             reasoning_effort: effort.clone(),
             tokens,
@@ -327,6 +338,23 @@ fn parse_file(
     }
     session_metadata.extend(metadata.into_values());
     Ok(())
+}
+
+pub(crate) fn non_empty_trimmed_str(v: Option<&Value>) -> Option<String> {
+    v?.as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn extract_workspace(payload: &Value) -> Option<String> {
+    non_empty_trimmed_str(payload.get("cwd")).or_else(|| {
+        payload
+            .get("runtime_workspace_roots")
+            .and_then(Value::as_array)?
+            .iter()
+            .find_map(|item| non_empty_trimmed_str(Some(item)))
+    })
 }
 
 pub(crate) fn string_at(v: &Value, keys: &[&str]) -> Option<String> {
@@ -734,5 +762,67 @@ mod tests {
                 .sum::<u64>(),
             15
         );
+    }
+
+    #[test]
+    fn session_meta_extracts_cwd_and_falls_back_to_runtime_workspace_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let cwd_rows = [
+            json!({"type":"session_meta","payload":{"id":"with-cwd","cwd":"  /work/project-a  "}}),
+            json!({"type":"session_meta","payload":{"id":"with-cwd","cwd":"/work/should-not-overwrite"}}),
+            json!({"type":"turn_context","payload":{"model":"m"}}),
+            json!({"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}}),
+        ];
+        std::fs::write(
+            sessions.join("rollout-cwd.jsonl"),
+            cwd_rows
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let fallback_rows = [
+            json!({"type":"session_meta","payload":{"id":"with-roots","cwd":"  ","runtime_workspace_roots":["", 123, "  /work/project-b  ", "/work/other"]}}),
+            json!({"type":"turn_context","payload":{"model":"m"}}),
+            json!({"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}}),
+        ];
+        std::fs::write(
+            sessions.join("rollout-roots.jsonl"),
+            fallback_rows
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let result = parse(root.path()).unwrap();
+        assert_eq!(result.records.len(), 2);
+        let cwd_meta = result
+            .session_metadata
+            .iter()
+            .find(|m| m.key.id.0 == "with-cwd")
+            .unwrap();
+        assert_eq!(cwd_meta.workspace.as_deref(), Some("/work/project-a"));
+        let cwd_rec = result
+            .records
+            .iter()
+            .find(|r| r.session_key.id.0 == "with-cwd")
+            .unwrap();
+        assert_eq!(cwd_rec.workspace.as_deref(), Some("/work/project-a"));
+        let roots_meta = result
+            .session_metadata
+            .iter()
+            .find(|m| m.key.id.0 == "with-roots")
+            .unwrap();
+        assert_eq!(roots_meta.workspace.as_deref(), Some("/work/project-b"));
+        let roots_rec = result
+            .records
+            .iter()
+            .find(|r| r.session_key.id.0 == "with-roots")
+            .unwrap();
+        assert_eq!(roots_rec.workspace.as_deref(), Some("/work/project-b"));
     }
 }

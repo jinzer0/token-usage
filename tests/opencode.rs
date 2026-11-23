@@ -1009,3 +1009,53 @@ fn new_york_fall_back_source_day_includes_both_repeated_hours_and_is_25_hours() 
         25,
     );
 }
+
+#[test]
+fn cli_json_and_detail_include_opencode_workspace() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("workspace.db");
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(
+        "CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, title TEXT, directory TEXT);
+         CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+         INSERT INTO session VALUES ('root', NULL, 'Root OC', '/work/oc-root'), ('child', 'root', 'Child OC', '/work/oc-child');",
+    )
+    .unwrap();
+    message(&db, "m1", "child", assistant());
+    drop(db);
+
+    let json_output = assert_cmd::Command::cargo_bin("token-usage")
+        .unwrap()
+        .args(["--client", "opencode", "--opencode-db"])
+        .arg(&path)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        json_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    assert_eq!(value["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(value["sessions"][0]["key"]["id"], json!("root"));
+    assert_eq!(value["sessions"][0]["workspace"], json!("/work/oc-root"));
+
+    let detail_output = assert_cmd::Command::cargo_bin("token-usage")
+        .unwrap()
+        .args(["--client", "opencode", "--opencode-db"])
+        .arg(&path)
+        .arg("opencode:root")
+        .output()
+        .unwrap();
+    assert!(
+        detail_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&detail_output.stderr)
+    );
+    let detail_stdout = String::from_utf8_lossy(&detail_output.stdout);
+    assert!(
+        detail_stdout.contains("workspace /work/oc-root"),
+        "{detail_stdout}"
+    );
+}

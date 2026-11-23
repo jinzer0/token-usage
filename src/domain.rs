@@ -111,6 +111,7 @@ pub struct UsageRecord {
     pub source_line: Option<u64>,
     pub started_at: Option<DateTime<Utc>>,
     pub session_name: Option<String>,
+    pub workspace: Option<String>,
     pub model: String,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub tokens: TokenStats,

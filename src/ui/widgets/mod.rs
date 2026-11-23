@@ -2,6 +2,7 @@ mod date_list;
 mod footer;
 mod header;
 mod help;
+mod models_view;
 mod session_detail;
 mod session_list;
 
@@ -10,29 +11,54 @@ use crate::ui::{
     layout,
     theme::Theme,
 };
-use ratatui::{Frame, widgets::Paragraph};
+use ratatui::{
+    Frame,
+    text::Line,
+    widgets::{Paragraph, Wrap},
+};
+
+fn scrollable_detail<'a>(
+    app: &mut App,
+    lines: Vec<Line<'a>>,
+    inner_width: u16,
+    viewport_height: usize,
+) -> Paragraph<'a> {
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    app.set_detail_metrics(paragraph.line_count(inner_width), viewport_height);
+    paragraph.scroll((app.detail_scroll.min(u16::MAX as usize) as u16, 0))
+}
 
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let theme = Theme::default();
     let area = frame.area();
     let layout = layout::calculate(area, app.tab);
     if layout.mode == layout::LayoutMode::TooSmall {
-        let message = if app.tab == ViewTab::Dates {
-            "Enlarge terminal for Dates\nMinimum: 110x12 (three panes)\n1 Sessions · q quit"
-        } else {
-            "Enlarge terminal\nMinimum: 40x10\n2 Dates needs 110x12 · q quit"
+        let message = match app.tab {
+            ViewTab::Dates => {
+                "Enlarge terminal for Dates\nMinimum: 110x12 (three panes)\n1 Sessions · 3 Models · q quit"
+            }
+            ViewTab::Models => {
+                "Enlarge terminal for Models\nMinimum: 80x14\n3 Models needs 80x14 · 1 Sessions · q quit"
+            }
+            ViewTab::Sessions => {
+                "Enlarge terminal\nMinimum: 40x10\n2 Dates needs 110x12 · 3 Models needs 80x14 · q quit"
+            }
         };
         frame.render_widget(Paragraph::new(message), area);
         return;
     }
     header::render(frame, layout.header, app, &theme);
-    if let Some(dates) = layout.dates {
-        date_list::render(frame, dates, app, &theme);
+    if app.tab == ViewTab::Models {
+        models_view::render(frame, layout, app, &theme);
+    } else {
+        if let Some(dates) = layout.dates {
+            date_list::render(frame, dates, app, &theme);
+        }
+        if let Some(sessions) = layout.sessions {
+            session_list::render(frame, sessions, app, &theme);
+        }
+        session_detail::render(frame, layout.detail, app, &theme, layout.mode);
     }
-    if let Some(sessions) = layout.sessions {
-        session_list::render(frame, sessions, app, &theme);
-    }
-    session_detail::render(frame, layout.detail, app, &theme, layout.mode);
     footer::render(frame, layout.footer, app, &theme, layout.mode);
     if app.help_visible {
         help::render(frame, area, &theme);
@@ -48,6 +74,23 @@ mod tests {
         scan::ParseResult,
     };
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn detail_scroll_counts_word_wrapping_and_reaches_last_line() {
+        use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+
+        let mut app = App::new(aggregate(vec![]).unwrap());
+        app.detail_scroll = 100;
+        let paragraph =
+            scrollable_detail(&mut app, vec![Line::from("aaaaaa bbbbbb cccccc")], 10, 2);
+        assert_eq!(app.detail_total_lines, 3);
+        assert_eq!(app.detail_scroll, 1);
+        let area = Rect::new(0, 0, 10, 2);
+        let mut buffer = Buffer::empty(area);
+        paragraph.render(area, &mut buffer);
+        let last_row: String = buffer.content()[10..].iter().map(|c| c.symbol()).collect();
+        assert!(last_row.contains("cccccc"));
+    }
 
     fn screen(terminal: &Terminal<TestBackend>) -> String {
         terminal
@@ -83,6 +126,7 @@ mod tests {
                 source_line: None,
                 started_at: None,
                 session_name: Some(name.into()),
+                workspace: None,
                 model: model.into(),
                 reasoning_effort: Some(ReasoningEffort::Custom("xhigh".into())),
                 tokens: TokenStats {
@@ -210,6 +254,7 @@ mod tests {
                 source_line: None,
                 started_at: Some(at.parse().unwrap()),
                 session_name: Some("한국어 세션 이름이 매우 긴 테스트 세션".into()),
+                workspace: None,
                 model: "原래 모델명".repeat(12),
                 reasoning_effort: None,
                 tokens: TokenStats {
@@ -262,6 +307,7 @@ mod tests {
                 source_line: None,
                 started_at: Some("2026-03-11T12:00:00Z".parse().unwrap()),
                 session_name: None,
+                workspace: None,
                 model: "same-model".into(),
                 reasoning_effort: Some(effort),
                 tokens: TokenStats {
@@ -318,5 +364,154 @@ mod tests {
         app.footer_notice = Some("Date gone; selection recovered".into());
         let text = screen(&draw(&mut app, 110, 12));
         assert!(text.contains("Date gone") && text.contains("q quit"));
+    }
+
+    #[test]
+    fn models_tab_renders_trend_chart_list_detail_and_clamps_scroll() {
+        let mut app = App::new(crate::ui::app::daily_test_snapshot([true; 3]));
+        app.switch_tab(ViewTab::Models);
+
+        let too_small = screen(&draw(&mut app, 79, 14));
+        assert!(too_small.contains("3 Models needs 80x14"));
+
+        let text = screen(&draw(&mut app, 120, 30));
+        for expected in [
+            "Daily Trend",
+            "All / All",
+            "peak 2026-03-11 300",
+            "avg 200/d",
+            "Models (3) · Tokens",
+            "day-unknown",
+            "day-new",
+            "day-old",
+            "Cache hit rate",
+            "Effort Breakdown",
+            "Top Sessions",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+
+        // Scroll past max gets clamped by render metrics
+        app.detail_scroll = 9999;
+        draw(&mut app, 120, 16);
+        assert_eq!(app.detail_scroll, app.detail_max_scroll);
+        let overflow_text = screen(&draw(&mut app, 120, 14));
+        assert!(overflow_text.contains("L"), "missing scroll indicator");
+
+        // Select second model and verify detail updates
+        app.select_model_at(1);
+        let text = screen(&draw(&mut app, 120, 30));
+        assert!(text.contains("Total 300 (300)"));
+    }
+
+    #[test]
+    fn period_filter_scopes_session_list_and_session_detail_in_sessions_tab() {
+        let now = chrono::Utc::now();
+        let old = now - chrono::Duration::days(45);
+        let mut result = ParseResult::empty(Client::Gjc, "period-scope".into());
+        for (at, model, total) in [(old, "ancient-model", 9000), (now, "today-model", 250)] {
+            result.records.push(UsageRecord {
+                session_key: SessionKey {
+                    client: Client::Gjc,
+                    id: SessionId("scoped-session".into()),
+                },
+                parent_session_key: None,
+                message_id: None,
+                source_path: "period-scope".into(),
+                source_line: None,
+                started_at: Some(at),
+                session_name: Some("Scoped".into()),
+                workspace: None,
+                model: model.into(),
+                reasoning_effort: None,
+                tokens: TokenStats {
+                    total_tokens: total,
+                    ..Default::default()
+                },
+            });
+        }
+        let mut app = App::new(aggregate(vec![result]).unwrap());
+        let all_text = screen(&draw(&mut app, 120, 24));
+        assert!(all_text.contains("Total 9250"));
+        assert!(all_text.contains("ancient-model") && all_text.contains("today-model"));
+
+        app.cycle_period_filter(); // Today
+        let today_term = draw(&mut app, 120, 24);
+        let today_text = screen(&today_term);
+        assert!(
+            today_text.contains("Total 250"),
+            "today detail: {today_text}"
+        );
+        assert!(today_text.contains("today-model"));
+        assert!(!today_text.contains("ancient-model"));
+        let session_pane: String = today_term
+            .backend()
+            .buffer()
+            .content()
+            .chunks(120)
+            .flat_map(|row| row[..40].iter().map(|cell| cell.symbol()))
+            .collect();
+        assert!(session_pane.contains("250"), "session pane: {session_pane}");
+        assert!(
+            !session_pane.contains("9.2K"),
+            "session pane leaked lifetime total: {session_pane}"
+        );
+    }
+
+    #[test]
+    fn detail_displays_workspace_and_multi_period_summary_and_workspace_is_searchable() {
+        let now = chrono::Utc::now();
+        let d5 = now - chrono::Duration::days(5);
+        let d20 = now - chrono::Duration::days(20);
+        let d45 = now - chrono::Duration::days(45);
+        let mut result = ParseResult::empty(Client::Codex, "ws-period".into());
+        for (at, total) in [(now, 100), (d5, 200), (d20, 400), (d45, 800)] {
+            result.records.push(UsageRecord {
+                session_key: SessionKey {
+                    client: Client::Codex,
+                    id: SessionId("ws-sess".into()),
+                },
+                parent_session_key: None,
+                message_id: None,
+                source_path: "ws-period".into(),
+                source_line: None,
+                started_at: Some(at),
+                session_name: Some("Workspace Session".into()),
+                workspace: Some("/opt/projects/token-usage".into()),
+                model: "gpt-5".into(),
+                reasoning_effort: None,
+                tokens: TokenStats {
+                    total_tokens: total,
+                    ..Default::default()
+                },
+            });
+        }
+        let mut app = App::new(aggregate(vec![result]).unwrap());
+        let text = screen(&draw(&mut app, 140, 24));
+        assert!(
+            text.contains("Workspace /opt/projects/token-usage"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Periods  today 100 · 7d 300 · 30d 700 · all 1.5K"),
+            "{text}"
+        );
+
+        // Apply custom 14d filter via interactive period input
+        app.start_period_input();
+        app.push_period_digit('1');
+        app.push_period_digit('4');
+        app.confirm_period_input();
+        let custom_text = screen(&draw(&mut app, 140, 24));
+        assert!(custom_text.contains("14d 300"), "{custom_text}");
+        assert!(custom_text.contains("Total 300"), "{custom_text}");
+
+        // Search by workspace path matches session
+        app.start_search();
+        for ch in "projects/token-usage".chars() {
+            app.push_search_char(ch);
+        }
+        app.confirm_search();
+        assert_eq!(app.filtered_sessions.len(), 1);
     }
 }

@@ -77,6 +77,9 @@ pub fn detail(session: &SessionStats, verbose: bool) -> String {
     if let Some(parent) = &session.parent {
         out.push_str(&format!("parent {}\n", parent.qualified()));
     }
+    if let Some(workspace) = &session.workspace {
+        out.push_str(&format!("workspace {}\n", workspace));
+    }
     out.push_str(&format!(
         "total {} input {} output {} reasoning {}\n",
         session.tokens.total_tokens,
