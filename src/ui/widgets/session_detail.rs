@@ -8,14 +8,25 @@ use crate::{
         theme::Theme,
     },
 };
+use chrono::Local;
 use ratatui::{
     Frame,
     layout::Rect,
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, mode: LayoutMode) {
+    let focused = app.focus == PaneFocus::Details;
+    let border_style = if focused {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        theme.border()
+    };
+
     if app.snapshot.sessions.is_empty() {
         let text = vec![
             Line::styled("No usage sessions found.", theme.title()),
@@ -27,7 +38,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, mode:
             Paragraph::new(text).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(theme.border()),
+                    .border_style(border_style),
             ),
             area,
         );
@@ -39,39 +50,75 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, mode:
             Paragraph::new("No matching sessions. Press Esc to clear search.").block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(theme.border()),
+                    .border_style(border_style),
             ),
             area,
         );
         return;
     };
 
-    let title = format::truncate_ellipsis(
-        session.name.as_deref().unwrap_or(&session.key.id.0),
-        area.width.saturating_sub(4) as usize,
-    );
+    let raw_title = session.name.as_deref().unwrap_or(&session.key.id.0);
+    let max_title_width = area.width.saturating_sub(4) as usize;
+    let title = if mode == LayoutMode::Narrow {
+        if let Some(pos) = app.selected_filtered_position() {
+            if !app.filtered_sessions.is_empty() {
+                let prefix = format!("[{}/{}] ", pos + 1, app.filtered_sessions.len());
+                let name_budget = max_title_width.saturating_sub(prefix.chars().count());
+                format!(
+                    "{prefix}{}",
+                    format::truncate_ellipsis(raw_title, name_budget)
+                )
+            } else {
+                format::truncate_ellipsis(raw_title, max_title_width)
+            }
+        } else {
+            format::truncate_ellipsis(raw_title, max_title_width)
+        }
+    } else {
+        format::truncate_ellipsis(raw_title, max_title_width)
+    };
+
+    let inner_width = area.width.saturating_sub(2);
     let lines = detail_lines(
         session,
         app.detail_scope,
         theme,
         app.breakdown,
         mode,
-        area.width.saturating_sub(2) as usize,
+        inner_width as usize,
     );
+    let total_lines = wrapped_line_count(&lines, inner_width as usize);
     let paragraph = Paragraph::new(lines)
         .scroll((app.detail_scroll.min(u16::MAX as usize) as u16, 0))
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(if app.focus == PaneFocus::Details {
-                    theme.title()
-                } else {
-                    theme.border()
-                })
-                .title(title),
+        .wrap(Wrap { trim: false });
+
+    let viewport_height = area.height.saturating_sub(2) as usize;
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(title);
+
+    if viewport_height > 0 && total_lines > viewport_height {
+        let start = (app.detail_scroll + 1).min(total_lines);
+        let end = app
+            .detail_scroll
+            .saturating_add(viewport_height)
+            .min(total_lines);
+        let arrow = match (app.detail_scroll > 0, end < total_lines) {
+            (true, true) => " ↕",
+            (false, true) => " ↓",
+            (true, false) => " ↑",
+            (false, false) => "",
+        };
+        let indicator = format!(" L{start}-{end}/{total_lines}{arrow} ");
+        block = block.title_bottom(
+            Line::from(indicator)
+                .right_aligned()
+                .style(theme.muted_text()),
         );
-    frame.render_widget(paragraph, area);
+    }
+
+    frame.render_widget(paragraph.block(block), area);
 }
 
 fn detail_lines(
@@ -82,8 +129,12 @@ fn detail_lines(
     mode: LayoutMode,
     width: usize,
 ) -> Vec<Line<'static>> {
-    let (tokens, models) = match scope {
-        DetailScope::All => (&session.tokens, session.models.as_slice()),
+    let (tokens, models, record_count) = match scope {
+        DetailScope::All => (
+            &session.tokens,
+            session.models.as_slice(),
+            session.record_count,
+        ),
         scope => {
             let day = match scope {
                 DetailScope::Day(day) => Some(day),
@@ -95,9 +146,14 @@ fn detail_lines(
                     Line::raw("No usage records in this date range."),
                 ];
             };
-            (&bucket.tokens, bucket.models.as_slice())
+            (
+                &bucket.tokens,
+                bucket.models.as_slice(),
+                bucket.record_count,
+            )
         }
     };
+
     let mut lines = Vec::new();
     let client = match session.key.client {
         Client::Codex => "CODEX",
@@ -122,15 +178,70 @@ fn detail_lines(
             theme.number(),
         ),
     ]));
-    lines.push(Line::styled(scope.label(), theme.muted_text()));
+
+    let rec_label = if record_count == 1 {
+        "1 record".to_string()
+    } else {
+        format!("{record_count} records")
+    };
     lines.push(Line::styled(
+        format!("{} · {rec_label}", scope.label()),
+        theme.muted_text(),
+    ));
+
+    if let Some(name) = &session.name
+        && name != &session.key.id.0
+    {
+        let max_id_len = width.saturating_sub(3).max(8);
+        let truncated_id = format::truncate_ellipsis(&session.key.id.0, max_id_len);
+        lines.push(Line::styled(
+            format!("ID {truncated_id}"),
+            theme.muted_text(),
+        ));
+    }
+
+    let time_line = match (session.last_used_at, session.started_at) {
+        (Some(last), Some(started)) => Some(format!(
+            "Last used {} · Started {}",
+            last.with_timezone(&Local).format("%Y-%m-%d %H:%M"),
+            started.with_timezone(&Local).format("%Y-%m-%d %H:%M")
+        )),
+        (Some(last), None) => Some(format!(
+            "Last used {}",
+            last.with_timezone(&Local).format("%Y-%m-%d %H:%M")
+        )),
+        (None, Some(started)) => Some(format!(
+            "Started {}",
+            started.with_timezone(&Local).format("%Y-%m-%d %H:%M")
+        )),
+        (None, None) => None,
+    };
+    if let Some(ts) = time_line {
+        lines.push(Line::styled(ts, theme.muted_text()));
+    }
+
+    let mut total_spans = vec![Span::styled(
         format!("Total {}", tokens.total_tokens),
         theme.number(),
-    ));
+    )];
+    if tokens.input_total > 0 {
+        let hit = format::percentage(
+            tokens.cache_read.min(tokens.input_total),
+            tokens.input_total,
+        );
+        total_spans.push(Span::styled(
+            format!("  ·  Cache hit {hit}"),
+            theme.muted_text(),
+        ));
+    }
+    lines.push(Line::from(total_spans));
+
     if breakdown {
         push_exact_components(&mut lines, tokens, theme);
     }
-    lines.push(Line::raw(""));
+
+    let divider_len = width.clamp(8, 46);
+    lines.push(Line::styled("─".repeat(divider_len), theme.border()));
 
     for (idx, model) in models.iter().enumerate() {
         if idx > 0 {
@@ -236,14 +347,14 @@ fn push_model(
     }
     if breakdown {
         lines.push(Line::styled(
-            format!("Model exact total {}", model.tokens.total_tokens),
+            format!("  Model exact total {}", model.tokens.total_tokens),
             theme.number(),
         ));
         push_exact_components(lines, &model.tokens, theme);
         for effort in &model.efforts {
             lines.push(Line::styled(
                 format!(
-                    "Effort {} exact total {}",
+                    "  Effort {} exact total {}",
                     effort_label(&effort.effort),
                     effort.tokens.total_tokens
                 ),
@@ -255,21 +366,28 @@ fn push_model(
 }
 
 fn push_exact_components(lines: &mut Vec<Line<'static>>, tokens: &TokenStats, theme: &Theme) {
-    for (label, value) in [
-        ("INPUT", tokens.input_total),
-        ("Uncached", tokens.input_uncached),
-        ("Cache read", tokens.cache_read),
-        ("Cache write", tokens.cache_write),
-        ("OUTPUT", tokens.output_total),
+    for (indent, label, value, style) in [
+        ("  ", "INPUT", tokens.input_total, theme.primary_text()),
+        (
+            "    ",
+            "Uncached",
+            tokens.input_uncached,
+            theme.muted_text(),
+        ),
+        ("    ", "Cache read", tokens.cache_read, theme.muted_text()),
+        (
+            "    ",
+            "Cache write",
+            tokens.cache_write,
+            theme.muted_text(),
+        ),
+        ("  ", "OUTPUT", tokens.output_total, theme.primary_text()),
     ] {
-        lines.push(Line::styled(
-            format!("{label} {value}"),
-            theme.primary_text(),
-        ));
+        lines.push(Line::styled(format!("{indent}{label} {value}"), style));
     }
     lines.push(Line::styled(
         format!(
-            "REASONING {}{}",
+            "  REASONING {}{}",
             tokens.reasoning_known,
             if tokens.reasoning_has_unknown {
                 "+ (some unknown)"
@@ -318,6 +436,16 @@ fn push_effort(
             theme.muted_text(),
         ));
     }
+}
+
+fn wrapped_line_count(lines: &[Line<'_>], width: usize) -> usize {
+    if width == 0 {
+        return 0;
+    }
+    lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(width))
+        .sum()
 }
 
 fn effort_label(effort: &Option<ReasoningEffort>) -> String {
@@ -402,6 +530,8 @@ mod tests {
         assert!(text.contains("gpt"));
         assert!(text.contains("xhigh"));
         assert!(text.contains("reasoning"));
+        assert!(text.contains("1 record"));
+        assert!(text.contains("ID s"));
     }
 
     #[test]
@@ -419,6 +549,8 @@ mod tests {
         let all = text(DetailScope::All, false, LayoutMode::Wide, 100);
         assert!(all.contains("day-old") && all.contains("day-new") && all.contains("day-unknown"));
         assert!(all.contains("27%"));
+        assert!(all.contains("3 records"));
+        assert!(all.contains("Cache hit"));
         let selected = text(DetailScope::Day(day), true, LayoutMode::Wide, 100);
         assert!(
             selected.contains("Local") && selected.contains("day-new") && selected.contains("300")
@@ -446,5 +578,34 @@ mod tests {
         );
         assert!(missing.contains("No usage records"));
         assert!(!missing.contains("day-new"));
+    }
+
+    #[test]
+    fn narrow_title_shows_position_and_scroll_indicator_appears_when_overflowing() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut app = App::new(crate::ui::app::daily_test_snapshot([true; 3]));
+        app.breakdown = true;
+        let mut terminal = Terminal::new(TestBackend::new(44, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    frame.area(),
+                    &app,
+                    &Theme::default(),
+                    LayoutMode::Narrow,
+                )
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("[1/1]"), "missing narrow position: {text}");
+        assert!(text.contains("L1-"), "missing scroll indicator: {text}");
     }
 }
