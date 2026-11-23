@@ -2,18 +2,34 @@ use crate::{
     diagnostics::Diagnostic,
     domain::{Client, MessageId, ReasoningEffort, SessionId, SessionKey, TokenStats, UsageRecord},
     scan::{ParseResult, ScanSummary, SessionMetadata},
-    sources::codex::{non_empty_trimmed_str, string_at, token_stats, u64_at},
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::File,
     io::{BufRead, BufReader},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 use walkdir::WalkDir;
+
+const READ_BUF_CAPACITY: usize = 64 * 1024;
+
+#[derive(Default)]
+struct FileOutput {
+    records: Vec<UsageRecord>,
+    session_metadata: Vec<SessionMetadata>,
+    diagnostics: Vec<Diagnostic>,
+    files_scanned: u64,
+    lines_read: u64,
+    records_emitted: u64,
+    records_skipped: u64,
+}
 
 pub fn parse(root: &Path) -> Result<ParseResult> {
     let mut summary = ScanSummary {
@@ -30,30 +46,73 @@ pub fn parse(root: &Path) -> Result<ParseResult> {
         });
     }
     summary.roots_scanned.push(root.to_path_buf());
-    let mut records = Vec::new();
-    let mut session_metadata = Vec::new();
-    let mut diagnostics = Vec::new();
-    let mut files = 0;
-    for entry in WalkDir::new(root)
+
+    let mut paths: Vec<PathBuf> = WalkDir::new(root)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
-    {
-        if entry.path().extension().and_then(|v| v.to_str()) != Some("jsonl") {
-            continue;
-        }
-        files += 1;
-        parse_file(
-            entry.path(),
-            &mut records,
-            &mut session_metadata,
-            &mut diagnostics,
-            &mut summary,
-        )?;
-    }
-    if files == 0 {
+        .filter(|e| e.path().extension().and_then(|v| v.to_str()) == Some("jsonl"))
+        .map(|e| e.into_path())
+        .collect();
+    paths.sort();
+
+    if paths.is_empty() {
         summary.empty_roots.push(root.to_path_buf());
+        return Ok(ParseResult {
+            records: vec![],
+            session_metadata: vec![],
+            diagnostics: vec![],
+            summary,
+        });
     }
+
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(paths.len());
+
+    let slots: Vec<Mutex<Option<Result<FileOutput>>>> =
+        (0..paths.len()).map(|_| Mutex::new(None)).collect();
+
+    if workers <= 1 {
+        for (slot, path) in slots.iter().zip(&paths) {
+            *slot.lock().expect("slot lock not poisoned") = Some(parse_file(path));
+        }
+    } else {
+        let next_idx = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    loop {
+                        let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                        if idx >= paths.len() {
+                            break;
+                        }
+                        let res = parse_file(&paths[idx]);
+                        *slots[idx].lock().expect("slot lock not poisoned") = Some(res);
+                    }
+                });
+            }
+        });
+    }
+
+    let mut records = Vec::new();
+    let mut session_metadata = Vec::new();
+    let mut diagnostics = Vec::new();
+    for slot in slots {
+        let output = slot
+            .into_inner()
+            .expect("slot lock not poisoned")
+            .expect("every path slot populated")?;
+        records.extend(output.records);
+        session_metadata.extend(output.session_metadata);
+        diagnostics.extend(output.diagnostics);
+        summary.files_scanned += output.files_scanned;
+        summary.lines_read += output.lines_read;
+        summary.records_emitted += output.records_emitted;
+        summary.records_skipped += output.records_skipped;
+    }
+
     Ok(ParseResult {
         records,
         session_metadata,
@@ -62,15 +121,13 @@ pub fn parse(root: &Path) -> Result<ParseResult> {
     })
 }
 
-fn parse_file(
-    path: &Path,
-    records: &mut Vec<UsageRecord>,
-    session_metadata: &mut Vec<SessionMetadata>,
-    diagnostics: &mut Vec<Diagnostic>,
-    summary: &mut ScanSummary,
-) -> Result<()> {
-    summary.files_scanned += 1;
+fn parse_file(path: &Path) -> Result<FileOutput> {
+    let mut output = FileOutput {
+        files_scanned: 1,
+        ..Default::default()
+    };
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut reader = BufReader::with_capacity(READ_BUF_CAPACITY, file);
     let fallback_id = path
         .file_stem()
         .and_then(|v| v.to_str())
@@ -85,15 +142,21 @@ fn parse_file(
     let mut branch_parent: HashMap<String, String> = HashMap::new();
     let mut seen = HashSet::new();
 
-    for (idx, line) in BufReader::new(file).lines().enumerate() {
-        let line_no = idx as u64 + 1;
-        summary.lines_read += 1;
-        let line = line?;
-        let v: Value = match serde_json::from_str(&line) {
+    let mut line = String::new();
+    let mut line_no: u64 = 0;
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        line_no += 1;
+        output.lines_read += 1;
+
+        let parsed: GjcLine = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(e) => {
-                summary.records_skipped += 1;
-                diagnostics.push(Diagnostic::warning(
+                output.records_skipped += 1;
+                output.diagnostics.push(Diagnostic::warning(
                     Client::Gjc,
                     "GjcMalformedLine",
                     e.to_string(),
@@ -103,19 +166,17 @@ fn parse_file(
                 continue;
             }
         };
-        let typ = string_at(&v, &["type", "event"]);
-        if matches!(
-            typ.as_deref(),
-            Some("header") | Some("session") | Some("header_patch")
-        ) {
-            if let Some(id) = string_at(&v, &["session_id", "sessionId", "id"]) {
-                session_id = id;
+
+        let typ = parsed.typ();
+        if matches!(typ, Some("header") | Some("session") | Some("header_patch")) {
+            if let Some(id) = parsed.header_session_id() {
+                session_id = id.to_string();
             }
-            if let Some(t) = string_at(&v, &["title", "name"]) {
-                title = Some(t);
+            let next_title = parsed.header_title();
+            if let Some(t) = next_title {
+                title = Some(t.to_string());
             }
-            let next_workspace =
-                trimmed_string_at(&v, &["cwd", "workspace", "working_dir", "workingDir"]);
+            let next_workspace = parsed.header_workspace();
             if let Some(w) = &next_workspace {
                 workspace = Some(w.clone());
             }
@@ -133,72 +194,57 @@ fn parse_file(
                     source_path: path.to_path_buf(),
                     source_line: Some(line_no),
                 });
-            if let Some(t) = string_at(&v, &["title", "name"]) {
-                entry.name = Some(t);
+            if let Some(t) = next_title {
+                entry.name = Some(t.to_string());
             }
             if let Some(w) = next_workspace {
                 entry.workspace = Some(w);
             }
             let mut next_parent = None;
-            for field in [
-                "parent_session_id",
-                "parentSessionId",
-                "parent_id",
-                "parentId",
-            ] {
-                if let Some(p) = v
-                    .get(field)
-                    .and_then(Value::as_str)
-                    .filter(|p| !p.trim().is_empty())
-                {
-                    next_parent.get_or_insert_with(|| p.to_string());
-                    entry.add_parent(
-                        SessionKey {
-                            client: Client::Gjc,
-                            id: SessionId(p.to_string()),
-                        },
-                        path.to_path_buf(),
-                        Some(line_no),
-                    );
-                }
+            for p in parsed.parent_candidates() {
+                next_parent.get_or_insert_with(|| p.to_string());
+                entry.add_parent(
+                    SessionKey {
+                        client: Client::Gjc,
+                        id: SessionId(p.to_string()),
+                    },
+                    path.to_path_buf(),
+                    Some(line_no),
+                );
             }
             if next_parent.is_some() {
                 parent_id = next_parent;
             }
         }
-        if matches!(typ.as_deref(), Some("thinking_level_change")) {
-            let branch = string_at(&v, &["branch", "branch_id", "branchId"])
-                .unwrap_or_else(|| "main".into());
-            if let Some(parent) = string_at(
-                &v,
-                &[
-                    "parent_branch",
-                    "parentBranch",
-                    "parent_branch_id",
-                    "parentBranchId",
-                ],
-            ) {
-                branch_parent.insert(branch.clone(), parent);
+        if matches!(typ, Some("thinking_level_change")) {
+            let branch = parsed.branch().unwrap_or("main").to_string();
+            if let Some(parent) = parsed.parent_branch() {
+                branch_parent.insert(branch.clone(), parent.to_string());
             }
-            if let Some(e) = string_at(&v, &["effort", "thinking_level", "thinkingLevel", "level"])
+            if let Some(e) = parsed.effort()
                 && e != "inherit"
             {
-                branch_effort.insert(branch, ReasoningEffort::parse(&e));
+                branch_effort.insert(branch, ReasoningEffort::parse(e));
             }
             continue;
         }
-        let message = v.get("message").unwrap_or(&v);
-        let role = string_at(message, &["role"]).or_else(|| string_at(&v, &["role"]));
-        if role.as_deref() != Some("assistant") && typ.as_deref() != Some("assistant") {
+        let msg = parsed.message.as_ref();
+        let role = msg
+            .and_then(|m| m.role.as_deref())
+            .or(parsed.role.as_deref());
+        if role != Some("assistant") && typ != Some("assistant") {
             continue;
         }
-        let Some(usage) = message.get("usage").or_else(|| v.get("usage")) else {
+        let Some(usage) = msg.and_then(|m| m.usage.as_ref()).or(parsed.usage.as_ref()) else {
             continue;
         };
-        let Some(model) = string_at(message, &["model"]).or_else(|| string_at(&v, &["model"]))
+        let Some(model) = msg
+            .and_then(|m| m.model.as_deref())
+            .or(parsed.model.as_deref())
+            .map(str::to_string)
         else {
-            summary.records_skipped += 1;
-            diagnostics.push(Diagnostic::warning(
+            output.records_skipped += 1;
+            output.diagnostics.push(Diagnostic::warning(
                 Client::Gjc,
                 "GjcMissingModel",
                 "assistant usage skipped because model is missing",
@@ -207,20 +253,22 @@ fn parse_file(
             ));
             continue;
         };
-        let msg_id = string_at(message, &["id", "message_id", "messageId"])
-            .or_else(|| string_at(&v, &["message_id", "messageId", "id"]));
+        let msg_id = msg
+            .and_then(GjcMessage::msg_id)
+            .or_else(|| parsed.top_msg_id())
+            .map(str::to_string);
         let key = msg_id.clone().unwrap_or_else(|| {
             format!(
                 "{}:{}:{}:{}",
                 path.display(),
                 line_no,
                 model,
-                u64_at(usage, &["total_tokens", "totalTokens", "total"]).unwrap_or(0)
+                usage.explicit_total().unwrap_or(0)
             )
         });
         if !seen.insert(key) {
-            summary.records_skipped += 1;
-            diagnostics.push(Diagnostic::warning(
+            output.records_skipped += 1;
+            output.diagnostics.push(Diagnostic::warning(
                 Client::Gjc,
                 "GjcDuplicateMessageSkipped",
                 "duplicate assistant usage skipped",
@@ -232,8 +280,8 @@ fn parse_file(
         let tokens = match normalize_usage(usage) {
             Ok(tokens) => tokens,
             Err(error) => {
-                summary.records_skipped += 1;
-                diagnostics.push(Diagnostic::error(
+                output.records_skipped += 1;
+                output.diagnostics.push(Diagnostic::error(
                     Client::Gjc,
                     "GjcTokenOverflow",
                     error.to_string(),
@@ -249,7 +297,7 @@ fn parse_file(
             && component_total != 0
             && tokens.total_tokens != component_total
         {
-            diagnostics.push(Diagnostic::warning(
+            output.diagnostics.push(Diagnostic::warning(
                 Client::Gjc,
                 "GjcTotalMismatch",
                 "totalTokens differs from input+output components",
@@ -257,15 +305,15 @@ fn parse_file(
                 Some(line_no),
             ));
         }
-        let branch = string_at(message, &["branch", "branch_id", "branchId"])
-            .or_else(|| string_at(&v, &["branch", "branch_id", "branchId"]));
-        let timestamp_raw = string_at(message, &["timestamp", "created_at", "createdAt"])
-            .or_else(|| string_at(&v, &["timestamp", "created_at", "createdAt"]));
+        let branch = msg.and_then(GjcMessage::branch).or_else(|| parsed.branch());
+        let timestamp_raw = msg
+            .and_then(GjcMessage::timestamp)
+            .or_else(|| parsed.timestamp());
         let timestamp = match timestamp_raw {
-            Some(raw) => match DateTime::parse_from_rfc3339(&raw) {
+            Some(raw) => match DateTime::parse_from_rfc3339(raw) {
                 Ok(dt) => Some(dt.with_timezone(&Utc)),
                 Err(e) => {
-                    diagnostics.push(Diagnostic::warning(
+                    output.diagnostics.push(Diagnostic::warning(
                         Client::Gjc,
                         "GjcInvalidTimestamp",
                         e.to_string(),
@@ -277,7 +325,7 @@ fn parse_file(
             },
             None => None,
         };
-        records.push(UsageRecord {
+        output.records.push(UsageRecord {
             session_key: SessionKey {
                 client: Client::Gjc,
                 id: SessionId(session_id.clone()),
@@ -293,23 +341,532 @@ fn parse_file(
             session_name: title.clone(),
             workspace: workspace.clone(),
             model,
-            reasoning_effort: resolve_effort(branch.as_deref(), &branch_effort, &branch_parent),
+            reasoning_effort: resolve_effort(branch, &branch_effort, &branch_parent),
             tokens,
         });
-        summary.records_emitted += 1;
+        output.records_emitted += 1;
     }
-    session_metadata.extend(metadata.into_values());
-    Ok(())
+    output.session_metadata.extend(metadata.into_values());
+    Ok(output)
 }
 
-fn trimmed_string_at(v: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|k| non_empty_trimmed_str(v.get(*k)))
+#[derive(Deserialize, Default)]
+struct GjcLine {
+    #[serde(rename = "type", default, deserialize_with = "opt_string")]
+    typ: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    event: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    session_id: Option<String>,
+    #[serde(rename = "sessionId", default, deserialize_with = "opt_string")]
+    session_id_camel: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    id: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    title: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    name: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    cwd: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    workspace: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    working_dir: Option<String>,
+    #[serde(rename = "workingDir", default, deserialize_with = "opt_string")]
+    working_dir_camel: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    parent_session_id: Option<String>,
+    #[serde(rename = "parentSessionId", default, deserialize_with = "opt_string")]
+    parent_session_id_camel: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    parent_id: Option<String>,
+    #[serde(rename = "parentId", default, deserialize_with = "opt_string")]
+    parent_id_camel: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    branch: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    branch_id: Option<String>,
+    #[serde(rename = "branchId", default, deserialize_with = "opt_string")]
+    branch_id_camel: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    parent_branch: Option<String>,
+    #[serde(rename = "parentBranch", default, deserialize_with = "opt_string")]
+    parent_branch_camel: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    parent_branch_id: Option<String>,
+    #[serde(rename = "parentBranchId", default, deserialize_with = "opt_string")]
+    parent_branch_id_camel: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    effort: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    thinking_level: Option<String>,
+    #[serde(rename = "thinkingLevel", default, deserialize_with = "opt_string")]
+    thinking_level_camel: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    level: Option<String>,
+    #[serde(default, deserialize_with = "opt_struct")]
+    message: Option<GjcMessage>,
+    #[serde(default, deserialize_with = "opt_string")]
+    role: Option<String>,
+    #[serde(default, deserialize_with = "opt_struct")]
+    usage: Option<UsageObject>,
+    #[serde(default, deserialize_with = "opt_string")]
+    model: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    message_id: Option<String>,
+    #[serde(rename = "messageId", default, deserialize_with = "opt_string")]
+    message_id_camel: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    timestamp: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    created_at: Option<String>,
+    #[serde(rename = "createdAt", default, deserialize_with = "opt_string")]
+    created_at_camel: Option<String>,
 }
 
-fn normalize_usage(usage: &Value) -> Result<TokenStats> {
-    let mut tokens = token_stats(usage)?;
+impl GjcLine {
+    fn typ(&self) -> Option<&str> {
+        self.typ.as_deref().or(self.event.as_deref())
+    }
+
+    fn header_session_id(&self) -> Option<&str> {
+        first_str(&[&self.session_id, &self.session_id_camel, &self.id])
+    }
+
+    fn header_title(&self) -> Option<&str> {
+        first_str(&[&self.title, &self.name])
+    }
+
+    fn header_workspace(&self) -> Option<String> {
+        [
+            &self.cwd,
+            &self.workspace,
+            &self.working_dir,
+            &self.working_dir_camel,
+        ]
+        .into_iter()
+        .find_map(|opt| {
+            opt.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+    }
+
+    fn parent_candidates(&self) -> impl Iterator<Item = &str> {
+        [
+            &self.parent_session_id,
+            &self.parent_session_id_camel,
+            &self.parent_id,
+            &self.parent_id_camel,
+        ]
+        .into_iter()
+        .filter_map(|opt| opt.as_deref().filter(|p| !p.trim().is_empty()))
+    }
+
+    fn branch(&self) -> Option<&str> {
+        first_str(&[&self.branch, &self.branch_id, &self.branch_id_camel])
+    }
+
+    fn parent_branch(&self) -> Option<&str> {
+        first_str(&[
+            &self.parent_branch,
+            &self.parent_branch_camel,
+            &self.parent_branch_id,
+            &self.parent_branch_id_camel,
+        ])
+    }
+
+    fn effort(&self) -> Option<&str> {
+        first_str(&[
+            &self.effort,
+            &self.thinking_level,
+            &self.thinking_level_camel,
+            &self.level,
+        ])
+    }
+
+    fn top_msg_id(&self) -> Option<&str> {
+        first_str(&[&self.message_id, &self.message_id_camel, &self.id])
+    }
+
+    fn timestamp(&self) -> Option<&str> {
+        first_str(&[&self.timestamp, &self.created_at, &self.created_at_camel])
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct GjcMessage {
+    #[serde(default, deserialize_with = "opt_string")]
+    role: Option<String>,
+    #[serde(default, deserialize_with = "opt_struct")]
+    usage: Option<UsageObject>,
+    #[serde(default, deserialize_with = "opt_string")]
+    model: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    id: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    message_id: Option<String>,
+    #[serde(rename = "messageId", default, deserialize_with = "opt_string")]
+    message_id_camel: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    branch: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    branch_id: Option<String>,
+    #[serde(rename = "branchId", default, deserialize_with = "opt_string")]
+    branch_id_camel: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    timestamp: Option<String>,
+    #[serde(default, deserialize_with = "opt_string")]
+    created_at: Option<String>,
+    #[serde(rename = "createdAt", default, deserialize_with = "opt_string")]
+    created_at_camel: Option<String>,
+}
+
+impl GjcMessage {
+    fn msg_id(&self) -> Option<&str> {
+        first_str(&[&self.id, &self.message_id, &self.message_id_camel])
+    }
+
+    fn branch(&self) -> Option<&str> {
+        first_str(&[&self.branch, &self.branch_id, &self.branch_id_camel])
+    }
+
+    fn timestamp(&self) -> Option<&str> {
+        first_str(&[&self.timestamp, &self.created_at, &self.created_at_camel])
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct UsageObject {
+    #[serde(default, deserialize_with = "opt_u64")]
+    input_tokens: Option<u64>,
+    #[serde(rename = "inputTokens", default, deserialize_with = "opt_u64")]
+    input_tokens_camel: Option<u64>,
+    #[serde(default, deserialize_with = "opt_u64")]
+    input: Option<u64>,
+    #[serde(default, deserialize_with = "opt_u64")]
+    prompt_tokens: Option<u64>,
+    #[serde(rename = "promptTokens", default, deserialize_with = "opt_u64")]
+    prompt_tokens_camel: Option<u64>,
+    #[serde(default, deserialize_with = "opt_u64")]
+    cache_read: Option<u64>,
+    #[serde(rename = "cacheRead", default, deserialize_with = "opt_u64")]
+    cache_read_camel: Option<u64>,
+    #[serde(default, deserialize_with = "opt_u64")]
+    cached_input_tokens: Option<u64>,
+    #[serde(rename = "cachedInputTokens", default, deserialize_with = "opt_u64")]
+    cached_input_tokens_camel: Option<u64>,
+    #[serde(default, deserialize_with = "opt_u64")]
+    cache_write: Option<u64>,
+    #[serde(rename = "cacheWrite", default, deserialize_with = "opt_u64")]
+    cache_write_camel: Option<u64>,
+    #[serde(default, deserialize_with = "opt_u64")]
+    cache_write_input_tokens: Option<u64>,
+    #[serde(default, deserialize_with = "opt_u64")]
+    output_tokens: Option<u64>,
+    #[serde(rename = "outputTokens", default, deserialize_with = "opt_u64")]
+    output_tokens_camel: Option<u64>,
+    #[serde(default, deserialize_with = "opt_u64")]
+    output: Option<u64>,
+    #[serde(default, deserialize_with = "opt_u64")]
+    completion_tokens: Option<u64>,
+    #[serde(rename = "completionTokens", default, deserialize_with = "opt_u64")]
+    completion_tokens_camel: Option<u64>,
+    #[serde(default, deserialize_with = "opt_u64")]
+    reasoning_tokens: Option<u64>,
+    #[serde(rename = "reasoningTokens", default, deserialize_with = "opt_u64")]
+    reasoning_tokens_camel: Option<u64>,
+    #[serde(default, deserialize_with = "opt_u64")]
+    reasoning_output_tokens: Option<u64>,
+    #[serde(default, deserialize_with = "opt_u64")]
+    total_tokens: Option<u64>,
+    #[serde(rename = "totalTokens", default, deserialize_with = "opt_u64")]
+    total_tokens_camel: Option<u64>,
+    #[serde(default, deserialize_with = "opt_u64")]
+    total: Option<u64>,
+}
+
+impl UsageObject {
+    fn explicit_total(&self) -> Option<u64> {
+        self.total_tokens.or(self.total_tokens_camel).or(self.total)
+    }
+
+    fn to_token_stats(&self) -> Result<TokenStats> {
+        let input_total = self
+            .input_tokens
+            .or(self.input_tokens_camel)
+            .or(self.input)
+            .or(self.prompt_tokens)
+            .or(self.prompt_tokens_camel)
+            .unwrap_or(0);
+        let cache_read = self
+            .cache_read
+            .or(self.cache_read_camel)
+            .or(self.cached_input_tokens)
+            .or(self.cached_input_tokens_camel)
+            .unwrap_or(0);
+        let cache_write = self
+            .cache_write
+            .or(self.cache_write_camel)
+            .or(self.cache_write_input_tokens)
+            .unwrap_or(0);
+        let output_total = self
+            .output_tokens
+            .or(self.output_tokens_camel)
+            .or(self.output)
+            .or(self.completion_tokens)
+            .or(self.completion_tokens_camel)
+            .unwrap_or(0);
+        let reasoning = self
+            .reasoning_tokens
+            .or(self.reasoning_tokens_camel)
+            .or(self.reasoning_output_tokens);
+        let component_total = input_total
+            .checked_add(output_total)
+            .context("token normalization overflow in input_total + output_total")?;
+        let total_tokens = self.explicit_total().unwrap_or(component_total);
+        Ok(TokenStats {
+            input_uncached: input_total.saturating_sub(cache_read),
+            input_total,
+            cache_read,
+            cache_write,
+            output_total,
+            reasoning_known: reasoning.unwrap_or(0),
+            reasoning_has_unknown: reasoning.is_none(),
+            total_tokens,
+        })
+    }
+}
+
+fn first_str<'a>(candidates: &[&'a Option<String>]) -> Option<&'a str> {
+    candidates.iter().find_map(|opt| opt.as_deref())
+}
+
+/// Deserialize an optional string while tolerating null or unexpected JSON types without erroring.
+fn opt_string<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptStringVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for OptStringVisitor {
+        type Value = Option<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an optional string or ignorable JSON value")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+            Ok(Some(v.to_owned()))
+        }
+
+        fn visit_string<E: serde::de::Error>(
+            self,
+            v: String,
+        ) -> std::result::Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: serde::Deserializer<'de>>(
+            self,
+            deserializer: D2,
+        ) -> std::result::Result<Self::Value, D2::Error> {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            while map
+                .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                .is_some()
+            {}
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(OptStringVisitor)
+}
+
+/// Deserialize an optional u64 while tolerating null or non-u64 JSON types without erroring.
+fn opt_u64<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptU64Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for OptU64Visitor {
+        type Value = Option<u64>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an optional u64 or ignorable JSON value")
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
+            Ok(u64::try_from(v).ok())
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: serde::Deserializer<'de>>(
+            self,
+            deserializer: D2,
+        ) -> std::result::Result<Self::Value, D2::Error> {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            while map
+                .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                .is_some()
+            {}
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(OptU64Visitor)
+}
+
+/// Deserialize an optional JSON object into `T`, ignoring null or non-object JSON types.
+fn opt_struct<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct OptStructVisitor<T>(std::marker::PhantomData<T>);
+
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for OptStructVisitor<T> {
+        type Value = Option<T>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an optional JSON object or ignorable JSON value")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: serde::Deserializer<'de>>(
+            self,
+            deserializer: D2,
+        ) -> std::result::Result<Self::Value, D2::Error> {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            T::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(Some)
+        }
+    }
+
+    deserializer.deserialize_any(OptStructVisitor(std::marker::PhantomData))
+}
+
+fn normalize_usage(usage: &UsageObject) -> Result<TokenStats> {
+    let mut tokens = usage.to_token_stats()?;
     // GJC's native `input` is uncached; cacheRead/cacheWrite are separate buckets.
-    if let Some(input) = usage.get("input").and_then(Value::as_u64) {
+    if let Some(input) = usage.input {
         tokens.input_uncached = input;
         tokens.input_total = input
             .checked_add(tokens.cache_read)
@@ -319,7 +876,7 @@ fn normalize_usage(usage: &Value) -> Result<TokenStats> {
             .input_total
             .checked_add(tokens.output_total)
             .context("token normalization overflow in input_total + output_total")?;
-        if u64_at(usage, &["total_tokens", "totalTokens", "total"]).is_none() {
+        if usage.explicit_total().is_none() {
             tokens.total_tokens = component_total;
         }
     }
@@ -349,7 +906,12 @@ fn resolve_effort(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
+
+    fn normalize_usage_value(value: Value) -> Result<TokenStats> {
+        let usage: UsageObject = serde_json::from_value(value)?;
+        normalize_usage(&usage)
+    }
 
     #[test]
     fn metadata_without_usage_keeps_all_parents_and_latest_title_patch() {
@@ -394,7 +956,7 @@ mod tests {
 
     #[test]
     fn native_input_and_cache_are_disjoint_and_output_does_not_double_count_reasoning() {
-        let tokens = normalize_usage(&json!({
+        let tokens = normalize_usage_value(json!({
             "input": 535, "output": 149, "cacheRead": 22784,
             "cacheWrite": 3, "totalTokens": 23471, "reasoningTokens": 20
         }))
@@ -409,12 +971,12 @@ mod tests {
     #[test]
     fn native_cache_overflow_is_rejected_and_explicit_total_is_preserved() {
         assert!(
-            normalize_usage(&json!({
+            normalize_usage_value(json!({
                 "input": u64::MAX, "cacheRead": 1, "totalTokens": 1
             }))
             .is_err()
         );
-        let tokens = normalize_usage(&json!({
+        let tokens = normalize_usage_value(json!({
             "input": 3, "cacheRead": 5, "cacheWrite": 2,
             "output": 4, "totalTokens": 17
         }))
@@ -422,7 +984,7 @@ mod tests {
         assert_eq!(tokens.input_total, 10);
         assert_eq!(tokens.total_tokens, 17);
         assert!(tokens.reasoning_has_unknown);
-        let tokens = normalize_usage(&json!({
+        let tokens = normalize_usage_value(json!({
             "input": 3, "cacheRead": 5, "cacheWrite": 2, "output": 4
         }))
         .unwrap();
@@ -492,5 +1054,131 @@ mod tests {
             .find(|m| m.key.id.0 == "s2")
             .unwrap();
         assert_eq!(s2_meta.workspace.as_deref(), Some("/work/gjc-fallback"));
+    }
+
+    #[test]
+    fn unexpected_optional_field_types_and_large_unknown_payloads_do_not_trigger_malformed() {
+        let root = tempfile::tempdir().unwrap();
+        let huge_text = "x".repeat(80 * 1024);
+        std::fs::write(
+            root.path().join("tolerant.jsonl"),
+            [
+                json!({"type":"header","session_id":"s-tol","parent_session_id":123,"parentId":["bad"],"title":{"nested":true},"cwd":false}),
+                json!({"type":"user","message":{"role":"user","content":huge_text,"tool_results":[{"output":huge_text}]}}),
+                json!({"type":"message","message":"string-not-object","role":"user"}),
+                json!({"type":"assistant","id":"top-only","model":"m","usage":{"input":"bad","output":4,"cacheRead":null}}),
+                json!({"type":"thinking_level_change","branch":42,"parent_branch":["ignored"],"effort":"high"}),
+                json!({"type":"assistant","message":{"messageId":"msg-2","model":"m2","usage":{"input":2,"output":3}}}),
+            ]
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let result = parse(root.path()).unwrap();
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(result.summary.lines_read, 6);
+        assert_eq!(result.summary.records_emitted, 2);
+        assert_eq!(result.summary.records_skipped, 0);
+        assert_eq!(result.records[0].message_id.as_ref().unwrap().0, "top-only");
+        assert_eq!(result.records[0].tokens.output_total, 4);
+        assert_eq!(result.records[1].message_id.as_ref().unwrap().0, "msg-2");
+        assert_eq!(
+            result.records[1].reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn parallel_multi_file_parsing_is_complete_and_deterministic() {
+        let root = tempfile::tempdir().unwrap();
+        let sub_a = root.path().join("a");
+        let sub_b = root.path().join("b");
+        std::fs::create_dir_all(&sub_a).unwrap();
+        std::fs::create_dir_all(&sub_b).unwrap();
+
+        let file_count = 12usize;
+        for i in 0..file_count {
+            let dir = if i % 2 == 0 { &sub_a } else { &sub_b };
+            let path = dir.join(format!("session-{i:02}.jsonl"));
+            let mut lines = vec![
+                json!({"type":"header","session_id":format!("s-{i:02}"),"title":format!("Title {i:02}")}).to_string(),
+                json!({"type":"user","message":{"role":"user","content":"ignored payload"}}).to_string(),
+                json!({"type":"assistant","message":{"id":format!("m-{i:02}"),"model":"m","usage":{"input":i + 1,"output":2}}}).to_string(),
+            ];
+            if i % 3 == 0 {
+                lines.push("not-valid-json".to_string());
+            }
+            std::fs::write(path, lines.join("\n")).unwrap();
+        }
+        std::fs::write(root.path().join("ignored.txt"), "not jsonl").unwrap();
+
+        let first = parse(root.path()).unwrap();
+        assert_eq!(first.summary.files_scanned, file_count as u64);
+        assert_eq!(first.summary.records_emitted, file_count as u64);
+        assert_eq!(first.summary.records_skipped, 4);
+        assert_eq!(first.records.len(), file_count);
+        assert_eq!(first.session_metadata.len(), file_count);
+        assert_eq!(first.diagnostics.len(), 4);
+
+        for window in first.records.windows(2) {
+            assert!(window[0].source_path < window[1].source_path);
+        }
+        for window in first.session_metadata.windows(2) {
+            assert!(window[0].source_path < window[1].source_path);
+        }
+        for window in first.diagnostics.windows(2) {
+            assert!(window[0].path < window[1].path);
+        }
+
+        for _ in 0..5 {
+            let rerun = parse(root.path()).unwrap();
+            assert_eq!(
+                rerun
+                    .records
+                    .iter()
+                    .map(|r| (&r.source_path, &r.session_key.id.0, r.tokens.total_tokens))
+                    .collect::<Vec<_>>(),
+                first
+                    .records
+                    .iter()
+                    .map(|r| (&r.source_path, &r.session_key.id.0, r.tokens.total_tokens))
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(
+                rerun
+                    .session_metadata
+                    .iter()
+                    .map(|m| (&m.source_path, &m.key.id.0))
+                    .collect::<Vec<_>>(),
+                first
+                    .session_metadata
+                    .iter()
+                    .map(|m| (&m.source_path, &m.key.id.0))
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(
+                rerun
+                    .diagnostics
+                    .iter()
+                    .map(|d| (&d.path, &d.code, d.line))
+                    .collect::<Vec<_>>(),
+                first
+                    .diagnostics
+                    .iter()
+                    .map(|d| (&d.path, &d.code, d.line))
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(rerun.summary.files_scanned, first.summary.files_scanned);
+            assert_eq!(rerun.summary.lines_read, first.summary.lines_read);
+            assert_eq!(rerun.summary.records_emitted, first.summary.records_emitted);
+            assert_eq!(rerun.summary.records_skipped, first.summary.records_skipped);
+        }
     }
 }
