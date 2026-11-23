@@ -1725,3 +1725,83 @@ fn daily_session_fixed_instants_local_midnight_and_dst() {
     }
     daily_assert_partition(session);
 }
+
+#[test]
+fn cli_tui_rejects_unknown_session_selector_before_starting_tui() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join("session.jsonl"),
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"session","id":"alpha","title":"Alpha Session"}),
+            serde_json::json!({
+                "type":"message","id":"m1","timestamp":"2026-09-01T12:00:00Z",
+                "message":{"role":"assistant","model":"m","usage":{"input":10,"output":5,"totalTokens":15}}
+            }),
+        ),
+    )
+    .unwrap();
+
+    assert_cmd::Command::cargo_bin("token-usage")
+        .unwrap()
+        .args(["--client", "gjc", "--gjc-home"])
+        .arg(dir.path())
+        .args(["--tui", "nonexistent-session"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("session not found"));
+}
+
+#[test]
+fn cli_group_by_with_session_scopes_timeline_and_rejects_unknown_session() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join("alpha.jsonl"),
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"session","id":"alpha","title":"Alpha Session"}),
+            serde_json::json!({
+                "type":"message","id":"a1","timestamp":"2026-09-01T12:00:00Z",
+                "message":{"role":"assistant","model":"m","usage":{"input":100,"output":25,"totalTokens":125}}
+            }),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("beta.jsonl"),
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"session","id":"beta","title":"Beta Session"}),
+            serde_json::json!({
+                "type":"message","id":"b1","timestamp":"2026-09-02T12:00:00Z",
+                "message":{"role":"assistant","model":"m","usage":{"input":400,"output":50,"totalTokens":450}}
+            }),
+        ),
+    )
+    .unwrap();
+
+    let output = assert_cmd::Command::cargo_bin("token-usage")
+        .unwrap()
+        .args(["--client", "gjc", "--gjc-home"])
+        .arg(dir.path())
+        .args(["--group-by", "day", "gjc:alpha"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(stdout.contains("2026-09-01"), "stdout:\n{stdout}");
+    assert!(stdout.contains("125"), "stdout:\n{stdout}");
+    assert!(!stdout.contains("2026-09-02"), "stdout:\n{stdout}");
+    assert!(!stdout.contains("450"), "stdout:\n{stdout}");
+
+    assert_cmd::Command::cargo_bin("token-usage")
+        .unwrap()
+        .args(["--client", "gjc", "--gjc-home"])
+        .arg(dir.path())
+        .args(["--group-by", "day", "missing-session"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("session not found"));
+}

@@ -1,14 +1,17 @@
 use crate::{
-    aggregate::{AggregateOptions, AggregateSnapshot, aggregate_with_options, resolve_session},
+    aggregate::{
+        AggregateOptions, AggregateSnapshot, SessionStats, TimeBucket, aggregate_with_options,
+        resolve_session,
+    },
     diagnostics::Severity,
-    domain::Client,
+    domain::{Client, TokenStats},
     format, sources,
     time::{self, GroupBy},
 };
-use anyhow::{Result, bail};
-use chrono::Local;
+use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Local, LocalResult, TimeZone, Utc};
 use clap::{Parser, ValueEnum};
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -55,6 +58,9 @@ pub fn run() -> Result<()> {
     validate(&cli)?;
     let snapshot = build_snapshot(&cli)?;
     if cli.tui {
+        if let Some(selector) = &cli.session {
+            let _ = resolve_session(&snapshot, selector)?;
+        }
         return crate::ui::run(snapshot, || build_snapshot(&cli));
     }
     if cli.json {
@@ -62,7 +68,13 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
     if let Some(group_by) = cli.group_by {
-        print!("{}", format::plain::timeline(&snapshot, group_by));
+        if let Some(selector) = &cli.session {
+            let session = resolve_session(&snapshot, selector)?;
+            let scoped = session_timeline_snapshot(&snapshot, session, group_by)?;
+            print!("{}", format::plain::timeline(&scoped, group_by));
+        } else {
+            print!("{}", format::plain::timeline(&snapshot, group_by));
+        }
         return Ok(());
     }
     if let Some(selector) = &cli.session {
@@ -135,4 +147,52 @@ impl From<ClientFilter> for Option<Client> {
             ClientFilter::Opencode => Some(Client::OpenCode),
         }
     }
+}
+
+fn session_timeline_snapshot(
+    snapshot: &AggregateSnapshot,
+    session: &SessionStats,
+    group_by: GroupBy,
+) -> Result<AggregateSnapshot> {
+    let mut timeline: BTreeMap<DateTime<Utc>, TimeBucket> = BTreeMap::new();
+    let mut missing_timestamp_records = 0u64;
+    for day_stat in &session.daily {
+        let Some(date) = day_stat.day else {
+            missing_timestamp_records = missing_timestamp_records
+                .checked_add(day_stat.record_count)
+                .context("count overflow in records_missing_timestamp_filtered")?;
+            continue;
+        };
+        let naive = date.and_hms_opt(12, 0, 0).context("invalid date")?;
+        let local_dt = match Local.from_local_datetime(&naive) {
+            LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => dt,
+            LocalResult::None => bail!("local date does not exist: {date}"),
+        };
+        let start = time::bucket_start(local_dt.with_timezone(&Utc), group_by)?;
+        let bucket = timeline.entry(start).or_insert_with(|| TimeBucket {
+            start,
+            tokens: TokenStats::default(),
+            record_count: 0,
+        });
+        bucket
+            .tokens
+            .checked_add_assign(&day_stat.tokens)
+            .context("session timeline bucket")?;
+        bucket.record_count = bucket
+            .record_count
+            .checked_add(day_stat.record_count)
+            .context("count overflow in session timeline records")?;
+    }
+    let mut source_counts = snapshot.source_counts.clone();
+    source_counts.records_missing_timestamp_filtered = missing_timestamp_records;
+    Ok(AggregateSnapshot {
+        generated_at: snapshot.generated_at,
+        totals: session.tokens.clone(),
+        sessions: vec![session.clone()],
+        dates: Vec::new(),
+        timeline: timeline.into_values().collect(),
+        periods: snapshot.periods.clone(),
+        diagnostics: snapshot.diagnostics.clone(),
+        source_counts,
+    })
 }
