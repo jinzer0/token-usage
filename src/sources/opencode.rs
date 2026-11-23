@@ -123,6 +123,7 @@ pub fn parse(path: &Path) -> Result<ParseResult> {
 struct Session {
     parent: Option<String>,
     title: Option<String>,
+    workspace: Option<String>,
 }
 
 // None means this node reaches a cycle: keep each original session's identity.
@@ -178,17 +179,40 @@ fn read_database(path: &Path, result: &mut ParseResult) -> Result<()> {
     transaction
         .prepare("SELECT id, session_id, time_created, data FROM message LIMIT 0")
         .context("unsupported OpenCode message schema")?;
+    let mut has_directory = false;
+    let mut has_path = false;
+    {
+        let mut pragma = transaction.prepare("PRAGMA table_info(session)")?;
+        let mut rows = pragma.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name.eq_ignore_ascii_case("directory") {
+                has_directory = true;
+            } else if name.eq_ignore_ascii_case("path") {
+                has_path = true;
+            }
+        }
+    }
+    let session_sql = format!(
+        "SELECT id, parent_id, title, {}, {} FROM session",
+        if has_directory { "directory" } else { "NULL" },
+        if has_path { "path" } else { "NULL" },
+    );
     let mut sessions = HashMap::new();
     {
-        let mut statement = transaction.prepare("SELECT id, parent_id, title FROM session")?;
+        let mut statement = transaction.prepare(&session_sql)?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let metadata = (|| -> rusqlite::Result<(String, Session)> {
+                let directory: Option<String> = row.get(3)?;
+                let session_path: Option<String> = row.get(4)?;
                 Ok((
                     row.get(0)?,
                     Session {
                         parent: row.get(1)?,
                         title: row.get(2)?,
+                        workspace: non_empty_trimmed(directory)
+                            .or_else(|| non_empty_trimmed(session_path)),
                     },
                 ))
             })();
@@ -370,6 +394,12 @@ fn normalize_usage(usage: &[Option<String>; 5]) -> Result<TokenStats> {
     })
 }
 
+fn non_empty_trimmed(value: Option<String>) -> Option<String> {
+    value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn escape_component(value: &str) -> String {
     value.replace('%', "%25").replace('/', "%2F")
 }
@@ -463,6 +493,7 @@ fn make_record(
         source_line: None,
         started_at,
         session_name: sessions.get(root).and_then(|s| s.title.clone()),
+        workspace: sessions.get(root).and_then(|s| s.workspace.clone()),
         model: format!("{}/{}", escape_component(provider), escape_component(model)),
         reasoning_effort: None,
         tokens,
@@ -700,6 +731,7 @@ mod tests {
             Session {
                 parent: None,
                 title: None,
+                workspace: None,
             },
         );
         for id in 1..10_000 {
@@ -708,6 +740,7 @@ mod tests {
                 Session {
                     parent: Some((id - 1).to_string()),
                     title: None,
+                    workspace: None,
                 },
             );
         }
@@ -736,6 +769,7 @@ mod tests {
                 Session {
                     parent: parent.map(str::to_string),
                     title: None,
+                    workspace: None,
                 },
             );
         }
@@ -760,5 +794,56 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn session_directory_and_path_fallback_and_minimal_schema_compat() {
+        let directory = tempfile::tempdir().unwrap();
+        let with_dirs_path = directory.path().join("with-dirs.db");
+        let db = Connection::open(&with_dirs_path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE session(id TEXT PRIMARY KEY, parent_id TEXT, title TEXT, directory TEXT, path TEXT); \
+             CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT); \
+             INSERT INTO session VALUES \
+               ('root', NULL, 'Root', '  /work/oc-root  ', '/work/ignored'), \
+               ('child', 'root', 'Child', '/work/oc-child', NULL), \
+               ('path-only', NULL, 'PathOnly', '  ', ' /work/oc-path '); \
+             INSERT INTO message VALUES \
+               ('m-child', 'child', 1000, '{\"role\":\"assistant\",\"providerID\":\"p\",\"modelID\":\"m\",\"time\":{\"created\":1000},\"tokens\":{\"input\":1,\"output\":1,\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}}}'), \
+               ('m-path', 'path-only', 1000, '{\"role\":\"assistant\",\"providerID\":\"p\",\"modelID\":\"m\",\"time\":{\"created\":1000},\"tokens\":{\"input\":1,\"output\":1,\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}}}');",
+        )
+        .unwrap();
+        drop(db);
+        let parsed = parse(&with_dirs_path).unwrap();
+        assert_eq!(parsed.records.len(), 2);
+        let child_rec = parsed
+            .records
+            .iter()
+            .find(|r| r.message_id.as_ref().unwrap().0 == "m-child")
+            .unwrap();
+        assert_eq!(child_rec.session_key.id.0, "root");
+        assert_eq!(child_rec.workspace.as_deref(), Some("/work/oc-root"));
+        let path_rec = parsed
+            .records
+            .iter()
+            .find(|r| r.message_id.as_ref().unwrap().0 == "m-path")
+            .unwrap();
+        assert_eq!(path_rec.workspace.as_deref(), Some("/work/oc-path"));
+
+        let minimal_path = directory.path().join("minimal.db");
+        let min_db = Connection::open(&minimal_path).unwrap();
+        min_db
+            .execute_batch(
+                "CREATE TABLE session(id TEXT PRIMARY KEY, parent_id TEXT, title TEXT); \
+                 CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT); \
+                 INSERT INTO session VALUES ('s1', NULL, 'Minimal'); \
+                 INSERT INTO message VALUES ('m1', 's1', 1000, '{\"role\":\"assistant\",\"providerID\":\"p\",\"modelID\":\"m\",\"time\":{\"created\":1000},\"tokens\":{\"input\":1,\"output\":1,\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}}}');",
+            )
+            .unwrap();
+        drop(min_db);
+        let minimal = parse(&minimal_path).unwrap();
+        assert_eq!(minimal.records.len(), 1);
+        assert!(minimal.diagnostics.is_empty());
+        assert_eq!(minimal.records[0].workspace, None);
     }
 }

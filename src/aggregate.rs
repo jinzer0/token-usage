@@ -31,6 +31,7 @@ pub struct SessionStats {
     pub key: SessionKey,
     pub parent: Option<SessionKey>,
     pub name: Option<String>,
+    pub workspace: Option<String>,
     pub started_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub tokens: TokenStats,
@@ -144,6 +145,7 @@ pub fn aggregate_with_options(
             if let Some(root) = roots.get(&record.session_key) {
                 record.session_key = root.clone();
                 record.session_name = graph[root].name.clone();
+                record.workspace = graph[root].workspace.clone();
                 record.parent_session_key = None;
             }
             let session = by_session.entry(record.session_key.clone()).or_default();
@@ -273,7 +275,12 @@ fn collect_sessions(results: &[ParseResult]) -> BTreeMap<SessionKey, SessionMeta
         .flat_map(|r| &r.session_metadata)
         .collect::<Vec<_>>();
     metadata.sort_by(|a, b| {
-        (&a.source_path, a.source_line, &a.name).cmp(&(&b.source_path, b.source_line, &b.name))
+        (&a.source_path, a.source_line, &a.name, &a.workspace).cmp(&(
+            &b.source_path,
+            b.source_line,
+            &b.name,
+            &b.workspace,
+        ))
     });
     for item in metadata {
         if !rollup_client(item.key.client) {
@@ -285,16 +292,20 @@ fn collect_sessions(results: &[ParseResult]) -> BTreeMap<SessionKey, SessionMeta
         if entry.name.is_none() {
             entry.name = item.name.clone();
         }
+        if entry.workspace.is_none() {
+            entry.workspace = item.workspace.clone();
+        }
         for (parent, (path, line)) in &item.parent_candidates {
             entry.add_parent(parent.clone(), path.clone(), *line);
         }
     }
     let mut records = results.iter().flat_map(|r| &r.records).collect::<Vec<_>>();
     records.sort_by(|a, b| {
-        (&a.source_path, a.source_line, &a.session_name).cmp(&(
+        (&a.source_path, a.source_line, &a.session_name, &a.workspace).cmp(&(
             &b.source_path,
             b.source_line,
             &b.session_name,
+            &b.workspace,
         ))
     });
     for record in records {
@@ -307,11 +318,15 @@ fn collect_sessions(results: &[ParseResult]) -> BTreeMap<SessionKey, SessionMeta
                 key: record.session_key.clone(),
                 parent_candidates: BTreeMap::new(),
                 name: None,
+                workspace: None,
                 source_path: record.source_path.clone(),
                 source_line: record.source_line,
             });
         if entry.name.is_none() {
             entry.name = record.session_name.clone();
+        }
+        if entry.workspace.is_none() {
+            entry.workspace = record.workspace.clone();
         }
         if let Some(parent) = &record.parent_session_key {
             entry.add_parent(
@@ -535,6 +550,7 @@ mod tests {
             source_line: None,
             started_at: at,
             session_name: None,
+            workspace: None,
             model: "raw-model".into(),
             reasoning_effort: None,
             tokens,
@@ -555,6 +571,7 @@ mod tests {
             },
             parent_candidates: BTreeMap::new(),
             name: name.map(str::to_string),
+            workspace: None,
             source_path: "metadata".into(),
             source_line: Some(1),
         };
@@ -955,6 +972,7 @@ mod tests {
                 source_line: None,
                 started_at: Some(time.parse().unwrap()),
                 session_name: None,
+                workspace: None,
                 model: "timezone-model".into(),
                 reasoning_effort: None,
                 tokens: TokenStats {
@@ -992,5 +1010,37 @@ mod tests {
         }
         assert!(expected.is_empty());
         assert_eq!(session.record_count, cases.len() as u64);
+    }
+
+    #[test]
+    fn rollup_preserves_root_workspace_and_does_not_leak_child_workspace() {
+        let mut child_record = fixture_record(Client::Gjc, "child", None, field_tokens(6, 5));
+        child_record.workspace = Some("/work/child-leak".into());
+        let mut child_meta = metadata(Client::Gjc, "child", &["root"], Some("Child"));
+        child_meta.workspace = Some("/work/child-leak".into());
+
+        // Case 1: root has no workspace, child has workspace -> root remains None.
+        let mut no_root_ws = fixture(vec![child_record.clone()]);
+        no_root_ws.session_metadata = vec![
+            metadata(Client::Gjc, "root", &[], Some("Root")),
+            child_meta.clone(),
+        ];
+        let snap1 = aggregate(vec![no_root_ws]).unwrap();
+        assert_eq!(snap1.sessions.len(), 1);
+        assert_eq!(snap1.sessions[0].key.id.0, "root");
+        assert_eq!(snap1.sessions[0].workspace, None);
+
+        // Case 2: root has workspace, child has different workspace -> root keeps its own workspace.
+        let mut root_meta = metadata(Client::Gjc, "root", &[], Some("Root"));
+        root_meta.workspace = Some("/work/root-dir".into());
+        let mut with_root_ws = fixture(vec![child_record]);
+        with_root_ws.session_metadata = vec![root_meta, child_meta];
+        let snap2 = aggregate(vec![with_root_ws]).unwrap();
+        assert_eq!(snap2.sessions.len(), 1);
+        assert_eq!(snap2.sessions[0].key.id.0, "root");
+        assert_eq!(
+            snap2.sessions[0].workspace.as_deref(),
+            Some("/work/root-dir")
+        );
     }
 }

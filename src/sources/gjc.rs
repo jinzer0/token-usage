@@ -2,7 +2,7 @@ use crate::{
     diagnostics::Diagnostic,
     domain::{Client, MessageId, ReasoningEffort, SessionId, SessionKey, TokenStats, UsageRecord},
     scan::{ParseResult, ScanSummary, SessionMetadata},
-    sources::codex::{string_at, token_stats, u64_at},
+    sources::codex::{non_empty_trimmed_str, string_at, token_stats, u64_at},
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -79,6 +79,7 @@ fn parse_file(
     let mut session_id = fallback_id;
     let mut parent_id = None::<String>;
     let mut title = None::<String>;
+    let mut workspace = None::<String>;
     let mut metadata = BTreeMap::<SessionKey, SessionMetadata>::new();
     let mut branch_effort: HashMap<String, Option<ReasoningEffort>> = HashMap::new();
     let mut branch_parent: HashMap<String, String> = HashMap::new();
@@ -113,6 +114,11 @@ fn parse_file(
             if let Some(t) = string_at(&v, &["title", "name"]) {
                 title = Some(t);
             }
+            let next_workspace =
+                trimmed_string_at(&v, &["cwd", "workspace", "working_dir", "workingDir"]);
+            if let Some(w) = &next_workspace {
+                workspace = Some(w.clone());
+            }
             let key = SessionKey {
                 client: Client::Gjc,
                 id: SessionId(session_id.clone()),
@@ -123,11 +129,15 @@ fn parse_file(
                     key,
                     parent_candidates: BTreeMap::new(),
                     name: None,
+                    workspace: None,
                     source_path: path.to_path_buf(),
                     source_line: Some(line_no),
                 });
             if let Some(t) = string_at(&v, &["title", "name"]) {
                 entry.name = Some(t);
+            }
+            if let Some(w) = next_workspace {
+                entry.workspace = Some(w);
             }
             let mut next_parent = None;
             for field in [
@@ -281,6 +291,7 @@ fn parse_file(
             source_line: Some(line_no),
             started_at: timestamp,
             session_name: title.clone(),
+            workspace: workspace.clone(),
             model,
             reasoning_effort: resolve_effort(branch.as_deref(), &branch_effort, &branch_parent),
             tokens,
@@ -289,6 +300,10 @@ fn parse_file(
     }
     session_metadata.extend(metadata.into_values());
     Ok(())
+}
+
+fn trimmed_string_at(v: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|k| non_empty_trimmed_str(v.get(*k)))
 }
 
 fn normalize_usage(usage: &Value) -> Result<TokenStats> {
@@ -412,5 +427,70 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(tokens.total_tokens, 14);
+    }
+
+    #[test]
+    fn header_cwd_and_patches_propagate_to_records_and_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("first.jsonl"),
+            [
+                json!({"type":"header","session_id":"s1","cwd":"  /work/gjc-initial  "}),
+                json!({"type":"assistant","message":{"id":"m1","model":"m","usage":{"input":3,"output":2}}}),
+                json!({"type":"header_patch","cwd":"/work/gjc-updated"}),
+                json!({"type":"header_patch","cwd":"   "}),
+                json!({"type":"header_patch","cwd":null}),
+                json!({"type":"assistant","message":{"id":"m2","model":"m","usage":{"input":1,"output":1}}}),
+            ]
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("second.jsonl"),
+            [
+                json!({"type":"session","id":"s2","cwd":"","workingDir":" /work/gjc-fallback "}),
+                json!({"type":"assistant","message":{"id":"m3","model":"m","usage":{"input":2,"output":2}}}),
+            ]
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+        let result = parse(root.path()).unwrap();
+        assert_eq!(result.records.len(), 3);
+        let m1 = result
+            .records
+            .iter()
+            .find(|r| r.message_id.as_ref().unwrap().0 == "m1")
+            .unwrap();
+        let m2 = result
+            .records
+            .iter()
+            .find(|r| r.message_id.as_ref().unwrap().0 == "m2")
+            .unwrap();
+        let m3 = result
+            .records
+            .iter()
+            .find(|r| r.message_id.as_ref().unwrap().0 == "m3")
+            .unwrap();
+        assert_eq!(m1.workspace.as_deref(), Some("/work/gjc-initial"));
+        assert_eq!(m2.workspace.as_deref(), Some("/work/gjc-updated"));
+        assert_eq!(m3.workspace.as_deref(), Some("/work/gjc-fallback"));
+        let s1_meta = result
+            .session_metadata
+            .iter()
+            .find(|m| m.key.id.0 == "s1")
+            .unwrap();
+        assert_eq!(s1_meta.workspace.as_deref(), Some("/work/gjc-updated"));
+        let s2_meta = result
+            .session_metadata
+            .iter()
+            .find(|m| m.key.id.0 == "s2")
+            .unwrap();
+        assert_eq!(s2_meta.workspace.as_deref(), Some("/work/gjc-fallback"));
     }
 }

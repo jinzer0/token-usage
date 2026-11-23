@@ -94,6 +94,7 @@ mod tests {
                 source_line: None,
                 started_at: None,
                 session_name: Some(name.into()),
+                workspace: None,
                 model: model.into(),
                 reasoning_effort: Some(ReasoningEffort::Custom("xhigh".into())),
                 tokens: TokenStats {
@@ -221,6 +222,7 @@ mod tests {
                 source_line: None,
                 started_at: Some(at.parse().unwrap()),
                 session_name: Some("한국어 세션 이름이 매우 긴 테스트 세션".into()),
+                workspace: None,
                 model: "原래 모델명".repeat(12),
                 reasoning_effort: None,
                 tokens: TokenStats {
@@ -273,6 +275,7 @@ mod tests {
                 source_line: None,
                 started_at: Some("2026-03-11T12:00:00Z".parse().unwrap()),
                 session_name: None,
+                workspace: None,
                 model: "same-model".into(),
                 reasoning_effort: Some(effort),
                 tokens: TokenStats {
@@ -386,6 +389,7 @@ mod tests {
                 source_line: None,
                 started_at: Some(at),
                 session_name: Some("Scoped".into()),
+                workspace: None,
                 model: model.into(),
                 reasoning_effort: None,
                 tokens: TokenStats {

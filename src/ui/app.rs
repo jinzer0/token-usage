@@ -1184,6 +1184,7 @@ pub(crate) fn daily_test_snapshot(keep: [bool; 3]) -> AggregateSnapshot {
             source_line: Some(index as u64 + 1),
             started_at: time.map(|time| time.parse().unwrap()),
             session_name: None,
+            workspace: None,
             model: model.into(),
             reasoning_effort: Some(ReasoningEffort::High),
             tokens: TokenStats {
@@ -1229,6 +1230,7 @@ fn test_snapshot(
                     .with_timezone(&chrono::Utc)
             }),
             session_name: None,
+            workspace: None,
             model: "model".into(),
             reasoning_effort: None,
             tokens: TokenStats {
@@ -1695,6 +1697,7 @@ mod tests {
                 source_line: None,
                 started_at: ts.map(|t| t.parse().unwrap()),
                 session_name: Some(id.into()),
+                workspace: None,
                 model: model.into(),
                 reasoning_effort: Some(ReasoningEffort::High),
                 tokens: TokenStats {

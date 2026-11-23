@@ -137,6 +137,7 @@ pub(super) struct SessionAccumulator {
     days: DailyFold,
     parent: Option<SessionKey>,
     name: Option<String>,
+    workspace: Option<String>,
     first_seen: Option<DateTime<Utc>>,
     last_seen: Option<DateTime<Utc>>,
 }
@@ -158,6 +159,7 @@ impl SessionAccumulator {
             .take()
             .or_else(|| record.parent_session_key.clone());
         self.name = self.name.take().or_else(|| record.session_name.clone());
+        self.workspace = self.workspace.take().or_else(|| record.workspace.clone());
         if let Some(at) = record.started_at {
             self.first_seen = Some(self.first_seen.map_or(at, |first| first.min(at)));
         }
@@ -176,6 +178,7 @@ impl SessionAccumulator {
             key,
             parent: self.parent,
             name: self.name,
+            workspace: self.workspace,
             started_at: self.first_seen,
             last_used_at: self.last_seen,
             tokens: all.tokens,
@@ -203,6 +206,7 @@ mod tests {
             source_line: None,
             started_at: None,
             session_name: None,
+            workspace: None,
             model: model.into(),
             reasoning_effort: Some(ReasoningEffort::Custom("exact".into())),
             tokens: TokenStats {

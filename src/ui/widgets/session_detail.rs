@@ -534,6 +534,7 @@ mod tests {
             },
             parent: None,
             name: Some("session".into()),
+            workspace: None,
             started_at: None,
             last_used_at: None,
             tokens: TokenStats {
