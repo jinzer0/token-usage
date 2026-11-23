@@ -1,11 +1,18 @@
-use super::app::{App, SearchMode, ViewTab};
+use super::{
+    app::{App, PaneFocus, SearchMode, ViewTab},
+    layout,
+};
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 
 pub fn handle_key<F>(app: &mut App, key: KeyEvent, reload: &mut F) -> Result<bool>
 where
     F: FnMut() -> Result<crate::aggregate::AggregateSnapshot>,
 {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Ok(true);
+    }
     if app.help_visible {
         match key.code {
             KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => app.help_visible = false,
@@ -26,14 +33,26 @@ where
         return Ok(false);
     }
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+        KeyCode::Char('q') => return Ok(true),
+        KeyCode::Esc => {
+            if app.search.mode == SearchMode::Confirmed || !app.search.query.is_empty() {
+                app.cancel_search();
+            } else {
+                return Ok(true);
+            }
+        }
         KeyCode::Char('1') => app.switch_tab(ViewTab::Sessions),
         KeyCode::Char('2') => app.switch_tab(ViewTab::Dates),
+        KeyCode::Char('3') => app.switch_tab(ViewTab::Models),
+        KeyCode::Char('c') => app.cycle_client_filter(),
+        KeyCode::Char('f') => app.cycle_period_filter(),
         KeyCode::BackTab | KeyCode::Left => app.move_focus(-1),
         KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => app.move_focus(-1),
         KeyCode::Tab | KeyCode::Right | KeyCode::Enter => app.move_focus(1),
         KeyCode::Down | KeyCode::Char('j') => app.move_down(),
         KeyCode::Up | KeyCode::Char('k') => app.move_up(),
+        KeyCode::Char('g') | KeyCode::Home => app.move_first(),
+        KeyCode::Char('G') | KeyCode::End => app.move_last(),
         KeyCode::Char('[') => app.move_date(-1),
         KeyCode::Char(']') => app.move_date(1),
         KeyCode::Char('J') => app.scroll_down(),
@@ -55,10 +74,132 @@ where
     Ok(false)
 }
 
+pub fn handle_mouse(app: &mut App, mouse: MouseEvent, area: Rect) {
+    if app.help_visible {
+        return;
+    }
+    let l = layout::calculate(area, app.tab);
+    if l.mode == layout::LayoutMode::TooSmall {
+        return;
+    }
+    let col = mouse.column;
+    let row = mouse.row;
+    match mouse.kind {
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+            let delta = if mouse.kind == MouseEventKind::ScrollDown {
+                1
+            } else {
+                -1
+            };
+            if l.dates.is_some_and(|r| contains(r, col, row)) {
+                app.move_date(delta);
+            } else if l.sessions.is_some_and(|r| contains(r, col, row)) {
+                app.move_selection(delta);
+            } else if l.models.is_some_and(|r| contains(r, col, row)) {
+                app.move_model(delta);
+            } else if contains(l.detail, col, row) {
+                if delta > 0 {
+                    app.scroll_down();
+                } else {
+                    app.scroll_up();
+                }
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if contains(l.header, col, row) && row == l.header.y {
+                let rel_x = col.saturating_sub(l.header.x);
+                if (14..25).contains(&rel_x) {
+                    app.switch_tab(ViewTab::Sessions);
+                } else if (25..36).contains(&rel_x) {
+                    app.switch_tab(ViewTab::Dates);
+                } else if (36..47).contains(&rel_x) {
+                    app.switch_tab(ViewTab::Models);
+                }
+                return;
+            }
+            if let Some(r) = l.dates
+                && contains(r, col, row)
+            {
+                app.focus = PaneFocus::Dates;
+                if inner_contains(r, col, row) {
+                    let rel_y = (row - r.y - 1) as usize;
+                    if let Some(pos) = date_row_at(app, rel_y) {
+                        app.select_date_at(pos);
+                    }
+                }
+            } else if let Some(r) = l.sessions
+                && contains(r, col, row)
+            {
+                app.focus = PaneFocus::Sessions;
+                if inner_contains(r, col, row) {
+                    let pos = app.session_list_state.offset() + (row - r.y - 1) as usize;
+                    app.select_session_at(pos);
+                }
+            } else if let Some(r) = l.models
+                && contains(r, col, row)
+            {
+                app.focus = PaneFocus::Models;
+                if inner_contains(r, col, row) {
+                    let pos = app.model_list_state.offset() + (row - r.y - 1) as usize;
+                    app.select_model_at(pos);
+                }
+            } else if contains(l.detail, col, row) {
+                app.focus = PaneFocus::Details;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn contains(rect: Rect, col: u16, row: u16) -> bool {
+    col >= rect.x && col < rect.right() && row >= rect.y && row < rect.bottom()
+}
+
+fn inner_contains(rect: Rect, col: u16, row: u16) -> bool {
+    col > rect.x && col + 1 < rect.right() && row > rect.y && row + 1 < rect.bottom()
+}
+
+fn date_row_at(app: &App, rel_y: usize) -> Option<usize> {
+    let pinned = app.pinned_session.is_some();
+    let mut y = 0usize;
+    for pos in app.date_list_state.offset()..app.visible_dates.len() {
+        let index = app.visible_dates[pos];
+        let date = app.snapshot.dates.get(index)?;
+        if app.date_tokens(index).is_none() {
+            continue;
+        }
+        let mut height = 2usize;
+        if date.day.is_some()
+            && app
+                .visible_dates
+                .get(pos + 1)
+                .and_then(|prev| {
+                    app.snapshot
+                        .dates
+                        .get(*prev)
+                        .and_then(|d| d.day)
+                        .map(|_| *prev)
+                })
+                .and_then(|prev| app.date_tokens(prev))
+                .is_some()
+        {
+            height += 2;
+        }
+        if pinned {
+            height += 1;
+        }
+        if rel_y < y + height {
+            return Some(pos);
+        }
+        y += height;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::app::{PaneFocus, SessionSort, daily_test_snapshot};
+    use crate::ui::app::{ClientScope, PeriodFilter, SessionSort, daily_test_snapshot};
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -121,6 +262,11 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Char('r')), &mut success).unwrap();
         assert!(app.footer_error.is_none());
         assert_eq!(app.detail_scroll, 4);
+        assert!(
+            app.footer_notice
+                .as_deref()
+                .is_some_and(|n| n.starts_with("Reloaded at "))
+        );
     }
     #[test]
     fn direct_tabs_focus_date_and_detail_routes_have_no_modal() {
@@ -146,6 +292,9 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Char('1')), &mut reload).unwrap();
         assert_eq!(app.tab, ViewTab::Sessions);
         assert_eq!(app.sort, SessionSort::LastUsed);
+        handle_key(&mut app, key(KeyCode::Char('3')), &mut reload).unwrap();
+        assert_eq!(app.tab, ViewTab::Models);
+        assert_eq!(app.focus, PaneFocus::Models);
         handle_key(&mut app, key(KeyCode::Char('d')), &mut reload).unwrap();
         assert_eq!(app.tab, ViewTab::Dates);
         assert!(app.pinned_session.is_some());
@@ -171,5 +320,76 @@ mod tests {
         assert_eq!(app.tab, ViewTab::Sessions);
         assert!(!handle_key(&mut app, key(KeyCode::Char('q')), &mut reload).unwrap());
         assert!(!app.help_visible);
+    }
+    #[test]
+    fn esc_clears_confirmed_search_before_quitting_and_ctrl_c_quits() {
+        let mut app = App::new(daily_test_snapshot([true; 3]));
+        let mut reload = || anyhow::bail!("unexpected reload");
+        handle_key(&mut app, key(KeyCode::Char('/')), &mut reload).unwrap();
+        handle_key(&mut app, key(KeyCode::Char('x')), &mut reload).unwrap();
+        handle_key(&mut app, key(KeyCode::Enter), &mut reload).unwrap();
+        assert_eq!(app.search.mode, SearchMode::Confirmed);
+        assert!(!handle_key(&mut app, key(KeyCode::Esc), &mut reload).unwrap());
+        assert_eq!(app.search.mode, SearchMode::Inactive);
+        assert!(app.search.query.is_empty());
+        assert!(handle_key(&mut app, key(KeyCode::Esc), &mut reload).unwrap());
+
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                &mut reload
+            )
+            .unwrap()
+        );
+    }
+    #[test]
+    fn client_period_quick_nav_and_mouse_events_work() {
+        let mut app = App::new(daily_test_snapshot([true; 3]));
+        let mut reload = || anyhow::bail!("unexpected reload");
+        handle_key(&mut app, key(KeyCode::Char('c')), &mut reload).unwrap();
+        assert_eq!(app.client_filter, ClientScope::Codex);
+        handle_key(&mut app, key(KeyCode::Char('c')), &mut reload).unwrap();
+        assert_eq!(app.client_filter, ClientScope::Gjc);
+        handle_key(&mut app, key(KeyCode::Char('f')), &mut reload).unwrap();
+        assert_eq!(app.period_filter, PeriodFilter::Today);
+        handle_key(&mut app, key(KeyCode::Char('f')), &mut reload).unwrap();
+        handle_key(&mut app, key(KeyCode::Char('f')), &mut reload).unwrap();
+        handle_key(&mut app, key(KeyCode::Char('f')), &mut reload).unwrap();
+        assert_eq!(app.period_filter, PeriodFilter::All);
+
+        let area = Rect::new(0, 0, 120, 30);
+        // Click "3 Models" in header (row 0, col 38)
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 38,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+        assert_eq!(app.tab, ViewTab::Models);
+        assert_eq!(app.focus, PaneFocus::Models);
+
+        // Mouse wheel down over detail pane (right side)
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 80,
+                row: 15,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+        assert_eq!(app.detail_scroll, 1);
+
+        // Quick nav g / G on models
+        handle_key(&mut app, key(KeyCode::Char('G')), &mut reload).unwrap();
+        assert_eq!(app.selected_model_position(), Some(2));
+        handle_key(&mut app, key(KeyCode::Char('g')), &mut reload).unwrap();
+        assert_eq!(app.selected_model_position(), Some(0));
     }
 }

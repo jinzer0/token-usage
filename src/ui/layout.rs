@@ -15,6 +15,8 @@ pub struct AppLayout {
     pub header: Rect,
     pub dates: Option<Rect>,
     pub sessions: Option<Rect>,
+    pub chart: Option<Rect>,
+    pub models: Option<Rect>,
     pub detail: Rect,
     pub footer: Rect,
 }
@@ -35,6 +37,8 @@ pub fn calculate(area: Rect, tab: ViewTab) -> AppLayout {
     let mode = match tab {
         ViewTab::Dates if area.width < 110 || area.height < 12 => LayoutMode::TooSmall,
         ViewTab::Dates => LayoutMode::Wide,
+        ViewTab::Models if area.width < 80 || area.height < 14 => LayoutMode::TooSmall,
+        ViewTab::Models => mode_for(area.width, area.height),
         ViewTab::Sessions => mode_for(area.width, area.height),
     };
     let vertical = Layout::default()
@@ -62,7 +66,29 @@ pub fn calculate(area: Rect, tab: ViewTab) -> AppLayout {
             header,
             dates: Some(horizontal[0]),
             sessions: Some(horizontal[1]),
+            chart: None,
+            models: None,
             detail: horizontal[2],
+            footer,
+        };
+    }
+    if tab == ViewTab::Models && mode != LayoutMode::TooSmall {
+        let models_vertical = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(6), Constraint::Min(0)])
+            .split(body);
+        let horizontal = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(models_vertical[1]);
+        return AppLayout {
+            mode,
+            header,
+            dates: None,
+            sessions: None,
+            chart: Some(models_vertical[0]),
+            models: Some(horizontal[0]),
+            detail: horizontal[1],
             footer,
         };
     }
@@ -72,6 +98,8 @@ pub fn calculate(area: Rect, tab: ViewTab) -> AppLayout {
             header,
             dates: None,
             sessions: None,
+            chart: None,
+            models: None,
             detail: body,
             footer,
         },
@@ -90,6 +118,8 @@ pub fn calculate(area: Rect, tab: ViewTab) -> AppLayout {
                 header,
                 dates: None,
                 sessions: Some(horizontal[0]),
+                chart: None,
+                models: None,
                 detail: horizontal[1],
                 footer,
             }
@@ -135,8 +165,24 @@ mod tests {
         assert_eq!(wide.detail.width, 86);
     }
     #[test]
+    fn models_require_minimum_80x14_and_split_chart_list_detail() {
+        for (width, height) in [(79, 14), (80, 13)] {
+            let layout = calculate(Rect::new(0, 0, width, height), ViewTab::Models);
+            assert_eq!(layout.mode, LayoutMode::TooSmall);
+            assert!(layout.chart.is_none() && layout.models.is_none());
+        }
+        let layout = calculate(Rect::new(0, 0, 80, 14), ViewTab::Models);
+        assert_eq!(layout.mode, LayoutMode::Medium);
+        assert_eq!(layout.chart.unwrap(), Rect::new(0, 2, 80, 6));
+        assert_eq!(layout.models.unwrap(), Rect::new(0, 8, 36, 5));
+        assert_eq!(layout.detail, Rect::new(36, 8, 44, 5));
+        let wide = calculate(Rect::new(0, 0, 120, 30), ViewTab::Models);
+        assert_eq!(wide.mode, LayoutMode::Wide);
+        assert_eq!(wide.chart.unwrap().height, 6);
+    }
+    #[test]
     fn zero_dimensions_are_safe_and_bounded() {
-        for tab in [ViewTab::Sessions, ViewTab::Dates] {
+        for tab in [ViewTab::Sessions, ViewTab::Dates, ViewTab::Models] {
             for (width, height) in [(0, 0), (0, 12), (110, 0), (1, 1)] {
                 let area = Rect::new(0, 0, width, height);
                 let layout = calculate(area, tab);

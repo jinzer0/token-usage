@@ -1,14 +1,82 @@
 use crate::{
-    aggregate::{AggregateSnapshot, DateStats, SessionDayStats, SessionStats},
-    domain::{SessionKey, TokenStats},
+    aggregate::{AggregateSnapshot, DateStats, EffortStats, SessionDayStats, SessionStats},
+    domain::{Client, ReasoningEffort, SessionKey, TokenStats},
 };
-use chrono::NaiveDate;
+use chrono::{Duration, Local, NaiveDate};
 use ratatui::widgets::ListState;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ViewTab {
     Sessions,
     Dates,
+    Models,
+}
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ClientScope {
+    All,
+    Codex,
+    Gjc,
+    OpenCode,
+}
+impl ClientScope {
+    pub fn next(self) -> Self {
+        match self {
+            Self::All => Self::Codex,
+            Self::Codex => Self::Gjc,
+            Self::Gjc => Self::OpenCode,
+            Self::OpenCode => Self::All,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Codex => "Codex",
+            Self::Gjc => "GJC",
+            Self::OpenCode => "OpenCode",
+        }
+    }
+    pub fn matches(self, client: Client) -> bool {
+        match self {
+            Self::All => true,
+            Self::Codex => client == Client::Codex,
+            Self::Gjc => client == Client::Gjc,
+            Self::OpenCode => client == Client::OpenCode,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PeriodFilter {
+    All,
+    Today,
+    SevenDays,
+    ThirtyDays,
+}
+impl PeriodFilter {
+    pub fn next(self) -> Self {
+        match self {
+            Self::All => Self::Today,
+            Self::Today => Self::SevenDays,
+            Self::SevenDays => Self::ThirtyDays,
+            Self::ThirtyDays => Self::All,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Today => "Today",
+            Self::SevenDays => "7d",
+            Self::ThirtyDays => "30d",
+        }
+    }
+    pub fn matches_day(self, day: Option<NaiveDate>, today: NaiveDate) -> bool {
+        match self {
+            Self::All => true,
+            Self::Today => day == Some(today),
+            Self::SevenDays => day.is_some_and(|d| d >= today - Duration::days(6) && d <= today),
+            Self::ThirtyDays => day.is_some_and(|d| d >= today - Duration::days(29) && d <= today),
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum SessionSort {
@@ -24,9 +92,48 @@ impl SessionSort {
     }
 }
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ModelSort {
+    Tokens,
+    Sessions,
+    Name,
+}
+impl ModelSort {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Tokens => Self::Sessions,
+            Self::Sessions => Self::Name,
+            Self::Name => Self::Tokens,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tokens => "Tokens",
+            Self::Sessions => "Sessions",
+            Self::Name => "Name",
+        }
+    }
+}
+#[derive(Debug, Clone)]
+pub struct ModelAggregateRow {
+    pub model: String,
+    pub tokens: TokenStats,
+    pub record_count: u64,
+    pub session_count: usize,
+    pub clients: Vec<Client>,
+    pub efforts: Vec<EffortStats>,
+    pub top_sessions: Vec<(SessionKey, Option<String>, u64)>,
+}
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DailyTrendPoint {
+    pub day: NaiveDate,
+    pub tokens: u64,
+    pub record_count: u64,
+}
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum PaneFocus {
     Dates,
     Sessions,
+    Models,
     Details,
 }
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -89,6 +196,8 @@ pub struct App {
     pub tab: ViewTab,
     pub sort: SessionSort,
     pub focus: PaneFocus,
+    pub client_filter: ClientScope,
+    pub period_filter: PeriodFilter,
     pub pinned_session: Option<SessionKey>,
     pub date_list_state: ListState,
     pub visible_dates: Vec<usize>,
@@ -96,8 +205,16 @@ pub struct App {
     pub session_list_state: ListState,
     pub selected_session: Option<SessionKey>,
     pub filtered_sessions: Vec<usize>,
+    pub model_rows: Vec<ModelAggregateRow>,
+    pub model_list_state: ListState,
+    pub selected_model: Option<String>,
+    pub trend_points: Vec<DailyTrendPoint>,
+    pub model_sort: ModelSort,
     pub detail_scope: DetailScope,
     pub detail_scroll: usize,
+    pub detail_max_scroll: usize,
+    pub detail_total_lines: usize,
+    pub detail_viewport_height: usize,
     pub breakdown: bool,
     pub search: SearchState,
     pub help_visible: bool,
@@ -105,23 +222,37 @@ pub struct App {
     pub footer_notice: Option<String>,
     sessions_state: TabState,
     dates_state: TabState,
+    models_state: TabState,
 }
 impl App {
     pub fn new(snapshot: AggregateSnapshot) -> Self {
+        Self::with_initial_session(snapshot, None)
+    }
+    pub fn with_initial_session(snapshot: AggregateSnapshot, initial: Option<SessionKey>) -> Self {
         let mut app = Self {
             snapshot,
             tab: ViewTab::Sessions,
             sort: SessionSort::LastUsed,
             focus: PaneFocus::Sessions,
+            client_filter: ClientScope::All,
+            period_filter: PeriodFilter::All,
             pinned_session: None,
             date_list_state: ListState::default(),
             visible_dates: Vec::new(),
             selected_date: None,
             session_list_state: ListState::default(),
-            selected_session: None,
+            selected_session: initial,
             filtered_sessions: Vec::new(),
+            model_rows: Vec::new(),
+            model_list_state: ListState::default(),
+            selected_model: None,
+            trend_points: Vec::new(),
+            model_sort: ModelSort::Tokens,
             detail_scope: DetailScope::All,
             detail_scroll: 0,
+            detail_max_scroll: 0,
+            detail_total_lines: 0,
+            detail_viewport_height: 0,
             breakdown: false,
             search: SearchState::default(),
             help_visible: false,
@@ -129,6 +260,7 @@ impl App {
             footer_notice: None,
             sessions_state: TabState::new(PaneFocus::Sessions),
             dates_state: TabState::new(PaneFocus::Dates),
+            models_state: TabState::new(PaneFocus::Models),
         };
         app.rebuild_filter();
         app
@@ -148,6 +280,13 @@ impl App {
         self.filtered_sessions
             .iter()
             .position(|&i| self.snapshot.sessions[i].key == *key)
+    }
+    pub fn selected_model_position(&self) -> Option<usize> {
+        let model = self.selected_model.as_ref()?;
+        self.model_rows.iter().position(|r| r.model == *model)
+    }
+    pub fn selected_model_row(&self) -> Option<&ModelAggregateRow> {
+        self.selected_model_position().map(|p| &self.model_rows[p])
     }
     pub fn selected_date_position(&self) -> Option<usize> {
         let scope = self.selected_date?;
@@ -170,23 +309,91 @@ impl App {
     }
     pub fn selected_tokens(&self, session_index: usize) -> Option<&TokenStats> {
         match self.tab {
-            ViewTab::Sessions => self.snapshot.sessions.get(session_index).map(|s| &s.tokens),
+            ViewTab::Sessions | ViewTab::Models => {
+                self.snapshot.sessions.get(session_index).map(|s| &s.tokens)
+            }
             ViewTab::Dates => self.selected_day_stats(session_index).map(|d| &d.tokens),
         }
     }
-    pub fn date_tokens(&self, date_index: usize) -> Option<&TokenStats> {
+    pub fn filtered_session_tokens(&self, session_index: usize) -> Option<TokenStats> {
+        let today = Local::now().date_naive();
+        self.filtered_session_tokens_on(session_index, today)
+    }
+    fn filtered_session_tokens_on(
+        &self,
+        session_index: usize,
+        today: NaiveDate,
+    ) -> Option<TokenStats> {
+        let session = self.snapshot.sessions.get(session_index)?;
+        if self.period_filter == PeriodFilter::All {
+            return Some(session.tokens.clone());
+        }
+        let mut sum = TokenStats::default();
+        let mut records = 0u64;
+        for bucket in &session.daily {
+            if bucket.record_count > 0 && self.period_filter.matches_day(bucket.day, today) {
+                add_tokens(&mut sum, &bucket.tokens);
+                records = records.saturating_add(bucket.record_count);
+            }
+        }
+        (records > 0).then_some(sum)
+    }
+    pub fn filtered_total_tokens(&self) -> u64 {
+        let today = Local::now().date_naive();
+        self.snapshot
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| self.client_filter.matches(s.key.client))
+            .filter_map(|(i, _)| self.filtered_session_tokens_on(i, today))
+            .fold(0u64, |acc, t| acc.saturating_add(t.total_tokens))
+    }
+    pub fn filtered_session_count(&self) -> usize {
+        let today = Local::now().date_naive();
+        self.snapshot
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| {
+                self.client_filter.matches(s.key.client)
+                    && self.filtered_session_tokens_on(*i, today).is_some()
+            })
+            .count()
+    }
+    pub fn date_tokens(&self, date_index: usize) -> Option<TokenStats> {
         let date = self.snapshot.dates.get(date_index)?;
         match &self.pinned_session {
-            None => Some(&date.tokens),
-            Some(key) => self
-                .snapshot
-                .sessions
-                .iter()
-                .find(|s| s.key == *key)?
-                .daily
-                .iter()
-                .find(|d| d.day == date.day && d.record_count > 0)
-                .map(|d| &d.tokens),
+            Some(key) => {
+                if !self.client_filter.matches(key.client) {
+                    return None;
+                }
+                self.snapshot
+                    .sessions
+                    .iter()
+                    .find(|s| s.key == *key)?
+                    .daily
+                    .iter()
+                    .find(|d| d.day == date.day && d.record_count > 0)
+                    .map(|d| d.tokens.clone())
+            }
+            None if self.client_filter == ClientScope::All => Some(date.tokens.clone()),
+            None => {
+                let mut sum = TokenStats::default();
+                let mut records = 0u64;
+                for item in &date.sessions {
+                    let session = self.snapshot.sessions.get(item.session_index)?;
+                    if !self.client_filter.matches(session.key.client) {
+                        continue;
+                    }
+                    if let Some(bucket) = session.daily.get(item.day_index)
+                        && bucket.record_count > 0
+                    {
+                        add_tokens(&mut sum, &bucket.tokens);
+                        records = records.saturating_add(bucket.record_count);
+                    }
+                }
+                (records > 0).then_some(sum)
+            }
         }
     }
     pub fn scope_available(&self, scope: DetailScope) -> bool {
@@ -197,6 +404,27 @@ impl App {
                     .any(|d| d.record_count > 0 && date_scope(d.day) == scope)
             })
     }
+    pub fn set_detail_metrics(&mut self, total_lines: usize, viewport_height: usize) {
+        self.detail_total_lines = total_lines;
+        self.detail_viewport_height = viewport_height;
+        self.detail_max_scroll = total_lines.saturating_sub(viewport_height);
+        self.detail_scroll = self.detail_scroll.min(self.detail_max_scroll);
+    }
+    fn clamp_detail_scroll(&mut self) {
+        if self.detail_total_lines > 0 {
+            self.detail_scroll = self.detail_scroll.min(self.detail_max_scroll);
+        }
+    }
+    pub fn cycle_client_filter(&mut self) {
+        self.client_filter = self.client_filter.next();
+        self.detail_scroll = 0;
+        self.rebuild_filter();
+    }
+    pub fn cycle_period_filter(&mut self) {
+        self.period_filter = self.period_filter.next();
+        self.detail_scroll = 0;
+        self.rebuild_filter();
+    }
     pub fn move_down(&mut self) {
         self.move_active(1);
     }
@@ -206,23 +434,58 @@ impl App {
     fn move_active(&mut self, delta: isize) {
         match self.focus {
             PaneFocus::Dates if self.tab == ViewTab::Dates => self.move_date(delta),
+            PaneFocus::Models if self.tab == ViewTab::Models => self.move_model(delta),
             PaneFocus::Details => {
-                self.detail_scroll = self.detail_scroll.saturating_add_signed(delta)
+                self.detail_scroll = self.detail_scroll.saturating_add_signed(delta);
+                self.clamp_detail_scroll();
             }
             _ => self.move_selection(delta),
         }
     }
+    pub fn move_first(&mut self) {
+        match self.focus {
+            PaneFocus::Dates if self.tab == ViewTab::Dates => self.select_date_at(0),
+            PaneFocus::Models if self.tab == ViewTab::Models => self.select_model_at(0),
+            PaneFocus::Details => self.detail_scroll = 0,
+            _ => self.select_session_at(0),
+        }
+    }
+    pub fn move_last(&mut self) {
+        match self.focus {
+            PaneFocus::Dates if self.tab == ViewTab::Dates => {
+                if !self.visible_dates.is_empty() {
+                    self.select_date_at(self.visible_dates.len() - 1);
+                }
+            }
+            PaneFocus::Models if self.tab == ViewTab::Models => {
+                if !self.model_rows.is_empty() {
+                    self.select_model_at(self.model_rows.len() - 1);
+                }
+            }
+            PaneFocus::Details => {
+                if self.detail_total_lines > 0 {
+                    self.detail_scroll = self.detail_max_scroll;
+                }
+            }
+            _ => {
+                if !self.filtered_sessions.is_empty() {
+                    self.select_session_at(self.filtered_sessions.len() - 1);
+                }
+            }
+        }
+    }
     pub fn scroll_down(&mut self) {
         self.detail_scroll = self.detail_scroll.saturating_add(1);
+        self.clamp_detail_scroll();
     }
     pub fn scroll_up(&mut self) {
         self.detail_scroll = self.detail_scroll.saturating_sub(1);
     }
     pub fn page_down(&mut self) {
-        self.detail_scroll = self.detail_scroll.saturating_add(8);
+        self.move_active(8);
     }
     pub fn page_up(&mut self) {
-        self.detail_scroll = self.detail_scroll.saturating_sub(8);
+        self.move_active(-8);
     }
     pub fn toggle_breakdown(&mut self) {
         self.breakdown = !self.breakdown;
@@ -232,6 +495,7 @@ impl App {
         let panes: &[PaneFocus] = match self.tab {
             ViewTab::Sessions => &[PaneFocus::Sessions, PaneFocus::Details],
             ViewTab::Dates => &[PaneFocus::Dates, PaneFocus::Sessions, PaneFocus::Details],
+            ViewTab::Models => &[PaneFocus::Models, PaneFocus::Details],
         };
         let current = panes.iter().position(|p| *p == self.focus).unwrap_or(0);
         self.focus = panes[(current as isize + delta).rem_euclid(panes.len() as isize) as usize];
@@ -244,6 +508,7 @@ impl App {
         let state = match tab {
             ViewTab::Sessions => &self.sessions_state,
             ViewTab::Dates => &self.dates_state,
+            ViewTab::Models => &self.models_state,
         }
         .clone();
         self.tab = tab;
@@ -252,6 +517,9 @@ impl App {
         self.focus = state.focus;
         self.session_list_state = state.list;
         self.detail_scroll = state.detail_scroll;
+        self.detail_total_lines = 0;
+        self.detail_viewport_height = 0;
+        self.detail_max_scroll = 0;
         self.rebuild_filter();
     }
     fn save_tab(&mut self) {
@@ -265,13 +533,18 @@ impl App {
         match self.tab {
             ViewTab::Sessions => self.sessions_state = state,
             ViewTab::Dates => self.dates_state = state,
+            ViewTab::Models => self.models_state = state,
         }
     }
     pub fn toggle_sort(&mut self) {
-        self.sort = match self.sort {
-            SessionSort::LastUsed => SessionSort::Tokens,
-            SessionSort::Tokens => SessionSort::LastUsed,
-        };
+        if self.tab == ViewTab::Models {
+            self.model_sort = self.model_sort.next();
+        } else {
+            self.sort = match self.sort {
+                SessionSort::LastUsed => SessionSort::Tokens,
+                SessionSort::Tokens => SessionSort::LastUsed,
+            };
+        }
         self.rebuild_filter();
     }
     pub fn open_session_dates(&mut self) {
@@ -315,7 +588,13 @@ impl App {
             .unwrap_or(0)
             .saturating_add_signed(delta)
             .min(self.visible_dates.len() - 1);
-        let scope = date_scope(self.snapshot.dates[self.visible_dates[p]].day);
+        self.select_date_at(p);
+    }
+    pub fn select_date_at(&mut self, position: usize) {
+        let Some(&date_index) = self.visible_dates.get(position) else {
+            return;
+        };
+        let scope = date_scope(self.snapshot.dates[date_index].day);
         if self.selected_date != Some(scope) {
             self.selected_date = Some(scope);
             self.detail_scroll = 0;
@@ -325,7 +604,7 @@ impl App {
             self.rebuild_filter();
         }
     }
-    fn move_selection(&mut self, delta: isize) {
+    pub(super) fn move_selection(&mut self, delta: isize) {
         if self.filtered_sessions.is_empty() {
             return;
         }
@@ -334,9 +613,13 @@ impl App {
             .unwrap_or(0)
             .saturating_add_signed(delta)
             .min(self.filtered_sessions.len() - 1);
-        let key = self.snapshot.sessions[self.filtered_sessions[p]]
-            .key
-            .clone();
+        self.select_session_at(p);
+    }
+    pub fn select_session_at(&mut self, position: usize) {
+        let Some(&session_index) = self.filtered_sessions.get(position) else {
+            return;
+        };
+        let key = self.snapshot.sessions[session_index].key.clone();
         if self.selected_session.as_ref() != Some(&key) {
             self.selected_session = Some(key.clone());
             self.detail_scroll = 0;
@@ -349,6 +632,27 @@ impl App {
         }
         self.session_list_state
             .select(self.selected_filtered_position());
+    }
+    pub(super) fn move_model(&mut self, delta: isize) {
+        if self.model_rows.is_empty() {
+            return;
+        }
+        let p = self
+            .selected_model_position()
+            .unwrap_or(0)
+            .saturating_add_signed(delta)
+            .min(self.model_rows.len() - 1);
+        self.select_model_at(p);
+    }
+    pub fn select_model_at(&mut self, position: usize) {
+        let Some(row) = self.model_rows.get(position) else {
+            return;
+        };
+        if self.selected_model.as_deref() != Some(&row.model) {
+            self.selected_model = Some(row.model.clone());
+            self.detail_scroll = 0;
+        }
+        self.model_list_state.select(self.selected_model_position());
     }
     pub fn start_search(&mut self) {
         self.search.mode = SearchMode::Editing;
@@ -375,12 +679,14 @@ impl App {
     }
     pub fn rebuild_filter(&mut self) {
         let query = self.search.query.trim().to_ascii_lowercase();
+        let today = Local::now().date_naive();
         if self.pinned_session.as_ref().is_some_and(|key| {
-            !self
-                .snapshot
-                .sessions
-                .iter()
-                .any(|s| s.key == *key && matches_session(s, &query))
+            !self.snapshot.sessions.iter().enumerate().any(|(i, s)| {
+                s.key == *key
+                    && self.client_filter.matches(s.key.client)
+                    && self.filtered_session_tokens_on(i, today).is_some()
+                    && matches_session(s, &query)
+            })
         }) {
             self.pinned_session = None;
             self.footer_notice = Some("Pinned session unavailable; unpinned".into());
@@ -390,16 +696,10 @@ impl App {
             .dates
             .iter()
             .enumerate()
-            .filter(|(_, d)| d.record_count > 0)
-            .filter(|(_, d)| {
-                self.pinned_session.as_ref().is_none_or(|key| {
-                    self.snapshot.sessions.iter().any(|s| {
-                        s.key == *key
-                            && s.daily
-                                .iter()
-                                .any(|sd| sd.day == d.day && sd.record_count > 0)
-                    })
-                })
+            .filter(|(i, d)| {
+                d.record_count > 0
+                    && self.period_filter.matches_day(d.day, today)
+                    && self.date_tokens(*i).is_some()
             })
             .map(|(i, _)| i)
             .collect();
@@ -417,8 +717,12 @@ impl App {
             .sessions
             .iter()
             .enumerate()
-            .filter(|(_, s)| matches_session(s, &query))
-            .filter(|(i, _)| self.tab == ViewTab::Sessions || self.selected_day_stats(*i).is_some())
+            .filter(|(i, s)| {
+                self.client_filter.matches(s.key.client)
+                    && self.filtered_session_tokens_on(*i, today).is_some()
+                    && matches_session(s, &query)
+            })
+            .filter(|(i, _)| self.tab != ViewTab::Dates || self.selected_day_stats(*i).is_some())
             .map(|(i, _)| i)
             .collect();
         let mut indices = std::mem::take(&mut self.filtered_sessions);
@@ -427,10 +731,21 @@ impl App {
             let sb = &self.snapshot.sessions[b];
             let primary = match self.sort {
                 SessionSort::LastUsed => sb.last_used_at.cmp(&sa.last_used_at),
-                SessionSort::Tokens => self
-                    .selected_tokens(b)
-                    .map(|t| t.total_tokens)
-                    .cmp(&self.selected_tokens(a).map(|t| t.total_tokens)),
+                SessionSort::Tokens => {
+                    let tb = match self.tab {
+                        ViewTab::Dates => self.selected_day_stats(b).map(|d| d.tokens.total_tokens),
+                        _ => self
+                            .filtered_session_tokens_on(b, today)
+                            .map(|t| t.total_tokens),
+                    };
+                    let ta = match self.tab {
+                        ViewTab::Dates => self.selected_day_stats(a).map(|d| d.tokens.total_tokens),
+                        _ => self
+                            .filtered_session_tokens_on(a, today)
+                            .map(|t| t.total_tokens),
+                    };
+                    tb.cmp(&ta)
+                }
             };
             primary
                 .then_with(|| sa.key.id.cmp(&sb.key.id))
@@ -450,9 +765,162 @@ impl App {
         self.session_list_state
             .select(self.selected_filtered_position());
         self.detail_scope = match self.tab {
-            ViewTab::Sessions => DetailScope::All,
+            ViewTab::Sessions | ViewTab::Models => DetailScope::All,
             ViewTab::Dates => self.selected_date.unwrap_or(DetailScope::All),
         };
+        self.rebuild_models_and_trends(&query, today);
+    }
+    fn rebuild_models_and_trends(&mut self, query: &str, today: NaiveDate) {
+        struct ModelAccum {
+            tokens: TokenStats,
+            record_count: u64,
+            clients: BTreeSet<Client>,
+            efforts: BTreeMap<Option<ReasoningEffort>, (TokenStats, u64)>,
+            top_sessions: Vec<(SessionKey, Option<String>, u64)>,
+        }
+        let mut model_map: BTreeMap<String, ModelAccum> = BTreeMap::new();
+        let mut trend_map: BTreeMap<NaiveDate, (u64, u64)> = BTreeMap::new();
+
+        for session in &self.snapshot.sessions {
+            if !self.client_filter.matches(session.key.client) {
+                continue;
+            }
+            let mut session_models: BTreeMap<String, (TokenStats, u64, Vec<&EffortStats>)> =
+                BTreeMap::new();
+            if self.period_filter == PeriodFilter::All {
+                for model in &session.models {
+                    if !query.is_empty() && !model.model.to_ascii_lowercase().contains(query) {
+                        continue;
+                    }
+                    let entry = session_models.entry(model.model.clone()).or_default();
+                    add_tokens(&mut entry.0, &model.tokens);
+                    entry.1 = entry.1.saturating_add(model.record_count);
+                    entry.2.extend(model.efforts.iter());
+                }
+                for bucket in &session.daily {
+                    if let Some(day) = bucket.day
+                        && bucket.record_count > 0
+                    {
+                        add_trend_bucket(&mut trend_map, day, bucket, query);
+                    }
+                }
+            } else {
+                for bucket in &session.daily {
+                    if bucket.record_count == 0
+                        || !self.period_filter.matches_day(bucket.day, today)
+                    {
+                        continue;
+                    }
+                    if let Some(day) = bucket.day {
+                        add_trend_bucket(&mut trend_map, day, bucket, query);
+                    }
+                    for model in &bucket.models {
+                        if !query.is_empty() && !model.model.to_ascii_lowercase().contains(query) {
+                            continue;
+                        }
+                        let entry = session_models.entry(model.model.clone()).or_default();
+                        add_tokens(&mut entry.0, &model.tokens);
+                        entry.1 = entry.1.saturating_add(model.record_count);
+                        entry.2.extend(model.efforts.iter());
+                    }
+                }
+            }
+
+            for (model_name, (tokens, record_count, efforts)) in session_models {
+                if record_count == 0 {
+                    continue;
+                }
+                let accum = model_map.entry(model_name).or_insert_with(|| ModelAccum {
+                    tokens: TokenStats::default(),
+                    record_count: 0,
+                    clients: BTreeSet::new(),
+                    efforts: BTreeMap::new(),
+                    top_sessions: Vec::new(),
+                });
+                add_tokens(&mut accum.tokens, &tokens);
+                accum.record_count = accum.record_count.saturating_add(record_count);
+                accum.clients.insert(session.key.client);
+                for eff in efforts {
+                    let eff_entry = accum.efforts.entry(eff.effort.clone()).or_default();
+                    add_tokens(&mut eff_entry.0, &eff.tokens);
+                    eff_entry.1 = eff_entry.1.saturating_add(eff.record_count);
+                }
+                accum.top_sessions.push((
+                    session.key.clone(),
+                    session.name.clone(),
+                    tokens.total_tokens,
+                ));
+            }
+        }
+
+        let mut rows: Vec<ModelAggregateRow> = model_map
+            .into_iter()
+            .map(|(model, mut accum)| {
+                let mut efforts: Vec<EffortStats> = accum
+                    .efforts
+                    .into_iter()
+                    .map(|(effort, (tokens, record_count))| EffortStats {
+                        effort,
+                        tokens,
+                        record_count,
+                    })
+                    .collect();
+                efforts.sort_by(|a, b| {
+                    b.tokens
+                        .total_tokens
+                        .cmp(&a.tokens.total_tokens)
+                        .then_with(|| effort_name(&a.effort).cmp(&effort_name(&b.effort)))
+                });
+                accum.top_sessions.sort_by(|a, b| {
+                    b.2.cmp(&a.2)
+                        .then_with(|| a.0.qualified().cmp(&b.0.qualified()))
+                });
+                let session_count = accum.top_sessions.len();
+                accum.top_sessions.truncate(10);
+                ModelAggregateRow {
+                    model,
+                    tokens: accum.tokens,
+                    record_count: accum.record_count,
+                    session_count,
+                    clients: accum.clients.into_iter().collect(),
+                    efforts,
+                    top_sessions: accum.top_sessions,
+                }
+            })
+            .collect();
+
+        rows.sort_by(|a, b| match self.model_sort {
+            ModelSort::Tokens => b
+                .tokens
+                .total_tokens
+                .cmp(&a.tokens.total_tokens)
+                .then_with(|| a.model.cmp(&b.model)),
+            ModelSort::Sessions => b
+                .session_count
+                .cmp(&a.session_count)
+                .then_with(|| b.tokens.total_tokens.cmp(&a.tokens.total_tokens))
+                .then_with(|| a.model.cmp(&b.model)),
+            ModelSort::Name => a.model.cmp(&b.model),
+        });
+
+        self.model_rows = rows;
+        if self.selected_model_position().is_none() {
+            let next_model = self.model_rows.first().map(|r| r.model.clone());
+            if self.tab == ViewTab::Models && self.selected_model != next_model {
+                self.detail_scroll = 0;
+            }
+            self.selected_model = next_model;
+        }
+        self.model_list_state.select(self.selected_model_position());
+
+        self.trend_points = trend_map
+            .into_iter()
+            .map(|(day, (tokens, record_count))| DailyTrendPoint {
+                day,
+                tokens,
+                record_count,
+            })
+            .collect();
     }
     pub fn replace_snapshot(&mut self, snapshot: AggregateSnapshot) {
         self.save_tab();
@@ -460,6 +928,7 @@ impl App {
         let old_date_key = self.dates_state.selected_session.clone();
         let old_pin = self.pinned_session.clone();
         let old_key = self.selected_session.clone();
+        let old_model = self.selected_model.clone();
         self.snapshot = snapshot;
         self.footer_error = None;
         self.footer_notice = None;
@@ -500,15 +969,17 @@ impl App {
         }
         if (self.tab == ViewTab::Dates && old_date != self.selected_date)
             || old_key != self.selected_session
+            || (self.tab == ViewTab::Models && old_model != self.selected_model)
         {
             self.detail_scroll = 0;
         }
-        // Reconcile the inactive view as well, so stale selections and scroll never reappear.
+        // Reconcile the inactive views as well, so stale selections and scroll never reappear.
         let active = self.tab;
-        self.switch_tab(match active {
-            ViewTab::Sessions => ViewTab::Dates,
-            ViewTab::Dates => ViewTab::Sessions,
-        });
+        for other in [ViewTab::Sessions, ViewTab::Dates, ViewTab::Models] {
+            if other != active {
+                self.switch_tab(other);
+            }
+        }
         self.switch_tab(active);
         if old_date_key.is_some()
             && old_date_key != self.dates_state.selected_session
@@ -517,10 +988,48 @@ impl App {
         {
             notices.push("Session date gone; first available session");
         }
-        if !notices.is_empty() {
+        if notices.is_empty() {
+            self.footer_notice = Some(format!("Reloaded at {}", Local::now().format("%H:%M:%S")));
+        } else {
             self.footer_notice = Some(notices.join("; "));
         }
     }
+}
+fn add_tokens(dst: &mut TokenStats, src: &TokenStats) {
+    dst.input_uncached = dst.input_uncached.saturating_add(src.input_uncached);
+    dst.input_total = dst.input_total.saturating_add(src.input_total);
+    dst.cache_read = dst.cache_read.saturating_add(src.cache_read);
+    dst.cache_write = dst.cache_write.saturating_add(src.cache_write);
+    dst.output_total = dst.output_total.saturating_add(src.output_total);
+    dst.reasoning_known = dst.reasoning_known.saturating_add(src.reasoning_known);
+    dst.reasoning_has_unknown |= src.reasoning_has_unknown;
+    dst.total_tokens = dst.total_tokens.saturating_add(src.total_tokens);
+}
+fn add_trend_bucket(
+    trend_map: &mut BTreeMap<NaiveDate, (u64, u64)>,
+    day: NaiveDate,
+    bucket: &SessionDayStats,
+    query: &str,
+) {
+    if query.is_empty() {
+        let entry = trend_map.entry(day).or_default();
+        entry.0 = entry.0.saturating_add(bucket.tokens.total_tokens);
+        entry.1 = entry.1.saturating_add(bucket.record_count);
+    } else {
+        for model in &bucket.models {
+            if model.model.to_ascii_lowercase().contains(query) && model.record_count > 0 {
+                let entry = trend_map.entry(day).or_default();
+                entry.0 = entry.0.saturating_add(model.tokens.total_tokens);
+                entry.1 = entry.1.saturating_add(model.record_count);
+            }
+        }
+    }
+}
+fn effort_name(effort: &Option<ReasoningEffort>) -> String {
+    effort
+        .as_ref()
+        .map(|e| e.label())
+        .unwrap_or_else(|| "none".into())
 }
 fn date_scope(day: Option<NaiveDate>) -> DetailScope {
     day.map(DetailScope::Day).unwrap_or(DetailScope::Undated)
@@ -875,7 +1384,11 @@ mod tests {
         app.replace_snapshot(daily_test_snapshot([true; 3]));
         assert_eq!(app.selected_date, date);
         assert_eq!(app.selected_session, key);
-        assert!(app.footer_notice.is_none());
+        assert!(
+            app.footer_notice
+                .as_deref()
+                .is_some_and(|n| n.starts_with("Reloaded at "))
+        );
         app.replace_snapshot(daily_test_snapshot([false, true, true]));
         assert_ne!(app.selected_date, date);
         assert!(app.footer_notice.as_ref().unwrap().contains("Date gone"));
@@ -1020,5 +1533,178 @@ mod tests {
         assert_eq!(app.selected_session().unwrap().key.id.0, "replacement");
         assert_eq!(app.detail_scroll, 0);
         assert!(app.footer_notice.as_ref().unwrap().contains("Session gone"));
+    }
+
+    #[test]
+    fn client_and_period_filters_update_sessions_dates_models_and_trends() {
+        use crate::{
+            aggregate::aggregate,
+            domain::{Client, ReasoningEffort, SessionId, UsageRecord},
+            scan::ParseResult,
+        };
+        let today = Local::now().date_naive();
+        let today_iso = format!("{today}T10:00:00Z");
+        let five_days_ago = (today - Duration::days(5))
+            .format("%Y-%m-%dT10:00:00Z")
+            .to_string();
+        let forty_days_ago = (today - Duration::days(40))
+            .format("%Y-%m-%dT10:00:00Z")
+            .to_string();
+
+        let mut result = ParseResult::empty(Client::Gjc, "filters".into());
+        for (client, id, ts, model, tokens) in [
+            (
+                Client::Codex,
+                "c-today",
+                Some(today_iso.as_str()),
+                "gpt-5",
+                100,
+            ),
+            (
+                Client::Gjc,
+                "g-5d",
+                Some(five_days_ago.as_str()),
+                "gemini-2.5",
+                200,
+            ),
+            (
+                Client::OpenCode,
+                "o-40d",
+                Some(forty_days_ago.as_str()),
+                "claude-4",
+                400,
+            ),
+            (Client::OpenCode, "o-undated", None, "claude-4", 800),
+        ] {
+            result.records.push(UsageRecord {
+                session_key: SessionKey {
+                    client,
+                    id: SessionId(id.into()),
+                },
+                parent_session_key: None,
+                message_id: None,
+                source_path: "filters".into(),
+                source_line: None,
+                started_at: ts.map(|t| t.parse().unwrap()),
+                session_name: Some(id.into()),
+                model: model.into(),
+                reasoning_effort: Some(ReasoningEffort::High),
+                tokens: TokenStats {
+                    total_tokens: tokens,
+                    input_total: tokens,
+                    ..Default::default()
+                },
+            });
+        }
+        let mut app = App::new(aggregate(vec![result]).unwrap());
+        assert_eq!(app.filtered_session_count(), 4);
+        assert_eq!(app.filtered_total_tokens(), 1500);
+        assert_eq!(app.model_rows.len(), 3);
+        assert_eq!(app.trend_points.len(), 3);
+
+        // Cycle client filter: All -> Codex -> Gjc -> OpenCode -> All
+        app.cycle_client_filter();
+        assert_eq!(app.client_filter, ClientScope::Codex);
+        assert_eq!(app.filtered_session_count(), 1);
+        assert_eq!(app.filtered_total_tokens(), 100);
+        assert_eq!(app.model_rows.len(), 1);
+        assert_eq!(app.model_rows[0].model, "gpt-5");
+        assert_eq!(app.visible_dates.len(), 1);
+        assert_eq!(
+            app.date_tokens(app.visible_dates[0]).unwrap().total_tokens,
+            100
+        );
+
+        app.cycle_client_filter();
+        assert_eq!(app.client_filter, ClientScope::Gjc);
+        assert_eq!(app.filtered_total_tokens(), 200);
+
+        app.cycle_client_filter();
+        assert_eq!(app.client_filter, ClientScope::OpenCode);
+        assert_eq!(app.filtered_session_count(), 2);
+        assert_eq!(app.filtered_total_tokens(), 1200);
+        assert_eq!(app.model_rows[0].session_count, 2);
+
+        app.cycle_client_filter();
+        assert_eq!(app.client_filter, ClientScope::All);
+
+        // Cycle period filter: All -> Today -> 7d -> 30d -> All
+        app.cycle_period_filter();
+        assert_eq!(app.period_filter, PeriodFilter::Today);
+        assert_eq!(app.filtered_session_count(), 1);
+        assert_eq!(app.filtered_total_tokens(), 100);
+        assert_eq!(app.visible_dates.len(), 1);
+        assert_eq!(app.trend_points.len(), 1);
+
+        app.cycle_period_filter();
+        assert_eq!(app.period_filter, PeriodFilter::SevenDays);
+        assert_eq!(app.filtered_session_count(), 2);
+        assert_eq!(app.filtered_total_tokens(), 300);
+        assert_eq!(app.visible_dates.len(), 2);
+
+        app.cycle_period_filter();
+        assert_eq!(app.period_filter, PeriodFilter::ThirtyDays);
+        assert_eq!(app.filtered_total_tokens(), 300);
+
+        app.cycle_period_filter();
+        assert_eq!(app.period_filter, PeriodFilter::All);
+        assert_eq!(app.filtered_total_tokens(), 1500);
+
+        // Preserves selected_model across filter changes
+        app.switch_tab(ViewTab::Models);
+        app.select_model_at(1);
+        let chosen = app.selected_model.clone();
+        assert!(chosen.is_some());
+        app.cycle_period_filter(); // Today (only gpt-5)
+        app.cycle_period_filter(); // 7d (gpt-5 + gemini-2.5)
+        app.cycle_period_filter(); // 30d
+        app.cycle_period_filter(); // All
+        assert_eq!(app.model_rows.len(), 3);
+    }
+
+    #[test]
+    fn quick_nav_paging_detail_clamping_and_initial_session() {
+        let rows = (0..12)
+            .map(|i| {
+                let id = format!("s{i:02}");
+                // Leak or convert? Use static? No, test_snapshot accepts &str, build Vec<String> first
+                id
+            })
+            .collect::<Vec<_>>();
+        let refs = rows
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str(), Gjc, None, (i as u64 + 1) * 10, true))
+            .collect::<Vec<_>>();
+        let snapshot = test_snapshot(&refs);
+        let target_key = SessionKey {
+            client: Gjc,
+            id: crate::domain::SessionId("s05".into()),
+        };
+        let mut app = App::with_initial_session(snapshot, Some(target_key.clone()));
+        assert_eq!(app.selected_session, Some(target_key));
+
+        app.move_first();
+        assert_eq!(app.selected_filtered_position(), Some(0));
+        app.page_down();
+        assert_eq!(app.selected_filtered_position(), Some(8));
+        app.move_last();
+        assert_eq!(app.selected_filtered_position(), Some(11));
+        app.page_up();
+        assert_eq!(app.selected_filtered_position(), Some(3));
+
+        app.focus = PaneFocus::Details;
+        app.set_detail_metrics(20, 10);
+        assert_eq!(app.detail_max_scroll, 10);
+        app.page_down();
+        assert_eq!(app.detail_scroll, 8);
+        app.page_down();
+        assert_eq!(app.detail_scroll, 10);
+        app.scroll_down();
+        assert_eq!(app.detail_scroll, 10);
+        app.move_first();
+        assert_eq!(app.detail_scroll, 0);
+        app.move_last();
+        assert_eq!(app.detail_scroll, 10);
     }
 }
