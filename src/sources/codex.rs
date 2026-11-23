@@ -9,7 +9,6 @@ use serde::Deserialize;
 use serde::de::{
     Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor, value::MapAccessDeserializer,
 };
-use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashMap},
     fmt,
@@ -1062,19 +1061,8 @@ fn deserialize_first_non_empty_trimmed_str_in_seq<'de, D: Deserializer<'de>>(
     deserializer.deserialize_any(FirstWorkspaceVisitor)
 }
 
-pub(crate) fn non_empty_trimmed_str(v: Option<&Value>) -> Option<String> {
-    v?.as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
-pub(crate) fn string_at(v: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|k| v.get(*k)?.as_str().map(str::to_string))
-}
-
-pub(crate) fn u64_at(v: &Value, keys: &[&str]) -> Option<u64> {
+#[cfg(test)]
+fn u64_at(v: &serde_json::Value, keys: &[&str]) -> Option<u64> {
     keys.iter().find_map(|k| v.get(*k)?.as_u64())
 }
 
@@ -1102,7 +1090,8 @@ fn compute_token_stats(
     })
 }
 
-pub(crate) fn token_stats(v: &Value) -> Result<TokenStats> {
+#[cfg(test)]
+fn token_stats(v: &serde_json::Value) -> Result<TokenStats> {
     let input_total = u64_at(
         v,
         &[
@@ -1161,7 +1150,7 @@ pub(crate) fn token_stats(v: &Value) -> Result<TokenStats> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     #[test]
     fn metadata_uses_official_parents_not_fork_or_shared_session_id() {
