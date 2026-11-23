@@ -6,7 +6,7 @@ use crate::ui::{
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem},
 };
@@ -15,10 +15,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
     let pinned = app.pinned_session.is_some();
     let focused = app.focus == PaneFocus::Dates;
     let inner_width = area.width.saturating_sub(2) as usize;
-    let focused_row_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
+    let focused_row_style = theme.selected_row_focused();
 
     let items = app
         .visible_dates
@@ -35,7 +32,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
             let row_style = if selected && focused {
                 focused_row_style
             } else if selected {
-                theme.selected_row()
+                theme.selected_row_unfocused()
             } else {
                 theme.primary_text()
             };
@@ -62,12 +59,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
                 let (text, style) = if delta > 0 {
                     (
                         format!("+{}", format::token_count(magnitude)),
-                        Style::default().fg(Color::Yellow),
+                        theme.delta_positive(),
                     )
                 } else if delta < 0 {
                     (
                         format!("-{}", format::token_count(magnitude)),
-                        Style::default().fg(Color::Green),
+                        theme.delta_negative(),
                     )
                 } else {
                     ("+0".into(), theme.muted_text())
@@ -76,8 +73,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
             });
 
             if let Some((delta_str, delta_style)) = delta_info {
-                let two_space_len = 2 + total_str.chars().count() + 2 + delta_str.chars().count();
-                let one_space_len = 2 + total_str.chars().count() + 1 + delta_str.chars().count();
+                let two_space_len =
+                    2 + format::display_width(&total_str) + 2 + format::display_width(&delta_str);
+                let one_space_len =
+                    2 + format::display_width(&total_str) + 1 + format::display_width(&delta_str);
                 let effective_delta_style = if selected && focused {
                     focused_row_style
                 } else {
@@ -124,9 +123,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
         "Dates · All sessions"
     };
     let border_style = if focused {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        theme.border_focused()
     } else {
         theme.border()
     };
@@ -152,7 +149,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
 mod tests {
     use super::*;
     use crate::ui::app::ViewTab;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::TestBackend, style::Color};
 
     #[test]
     fn renders_compact_colored_deltas_and_focus_highlight() {

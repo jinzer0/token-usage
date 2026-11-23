@@ -74,16 +74,18 @@ fn render_trend_chart(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Them
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(theme.border())
-                .title(title),
+                .title(Line::styled(title, theme.chart_peak())),
         )
         .data(&values)
-        .style(theme.bar_full());
+        .style(theme.chart_bar());
     frame.render_widget(sparkline, area);
 }
 
 fn render_models_list(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
     let inner_width = area.width.saturating_sub(2) as usize;
     let filtered_total = app.filtered_total_tokens();
+    let focused = app.focus == PaneFocus::Models;
+    let focused_row_style = theme.selected_row_focused();
     let items: Vec<ListItem<'_>> = app
         .model_rows
         .iter()
@@ -91,8 +93,10 @@ fn render_models_list(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &
         .map(|(pos, row)| {
             let selected = app.selected_model_position() == Some(pos);
             let marker = if selected { "›" } else { " " };
-            let style = if selected {
-                theme.selected_row()
+            let style = if selected && focused {
+                focused_row_style
+            } else if selected {
+                theme.selected_row_unfocused()
             } else {
                 theme.primary_text()
             };
@@ -111,25 +115,50 @@ fn render_models_list(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &
                 client_tag.len() + 1 + bar_space + total_str.len() + 1 + pct_str.len().max(4);
             let name_width = inner_width.saturating_sub(2 + right_width + 1).max(1);
             let name = format::truncate_ellipsis(&row.model, name_width);
-            let gap = inner_width.saturating_sub(2 + name.chars().count() + right_width);
+            let gap = inner_width.saturating_sub(2 + format::display_width(&name) + right_width);
 
             let mut spans = vec![
                 Span::styled(format!("{marker} "), style),
                 Span::styled(name, style),
                 Span::raw(" ".repeat(gap)),
-                Span::styled(client_tag, theme.muted_text()),
+                Span::styled(
+                    client_tag,
+                    if selected && focused {
+                        focused_row_style
+                    } else {
+                        theme.muted_text()
+                    },
+                ),
                 Span::raw(" "),
             ];
             if bar_width > 0 {
                 let bar = format::usage_bar(row.tokens.total_tokens, filtered_total, bar_width);
-                spans.push(Span::styled(bar, theme.bar_full()));
+                spans.push(Span::styled(
+                    bar,
+                    if selected && focused {
+                        focused_row_style
+                    } else {
+                        theme.bar_full()
+                    },
+                ));
                 spans.push(Span::raw(" "));
             }
-            spans.push(Span::styled(total_str, theme.number()));
+            spans.push(Span::styled(
+                total_str,
+                if selected && focused {
+                    focused_row_style
+                } else {
+                    theme.number()
+                },
+            ));
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
                 format::pad_left(&pct_str, pct_str.len().max(4)),
-                theme.percentage(),
+                if selected && focused {
+                    focused_row_style
+                } else {
+                    theme.percentage()
+                },
             ));
             ListItem::new(Line::from(spans))
         })
@@ -153,14 +182,18 @@ fn render_models_list(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(if app.focus == PaneFocus::Models {
-                    theme.title()
+                .border_style(if focused {
+                    theme.border_focused()
                 } else {
                     theme.border()
                 })
                 .title(title),
         )
-        .highlight_style(theme.selected_row());
+        .highlight_style(if focused {
+            focused_row_style
+        } else {
+            ratatui::style::Style::default()
+        });
     frame.render_stateful_widget(list, area, &mut app.model_list_state);
 }
 
@@ -179,7 +212,7 @@ fn render_model_detail(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: 
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(if app.focus == PaneFocus::Details {
-                        theme.title()
+                        theme.border_focused()
                     } else {
                         theme.border()
                     })
@@ -208,7 +241,7 @@ fn render_model_detail(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: 
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(if app.focus == PaneFocus::Details {
-                    theme.title()
+                    theme.border_focused()
                 } else {
                     theme.border()
                 })
@@ -358,8 +391,8 @@ fn model_detail_lines(
             .saturating_sub(6 + total.len() + sess_pct.len() + 3)
             .max(1);
         let trunc = format::truncate_ellipsis(label, avail);
-        let gap =
-            width.saturating_sub(6 + trunc.chars().count() + total.len() + sess_pct.len() + 2);
+        let gap = width
+            .saturating_sub(6 + format::display_width(&trunc) + total.len() + sess_pct.len() + 2);
         lines.push(Line::from(vec![
             Span::raw("  ["),
             Span::styled(

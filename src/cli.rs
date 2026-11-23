@@ -58,10 +58,11 @@ pub fn run() -> Result<()> {
     validate(&cli)?;
     let snapshot = build_snapshot(&cli)?;
     if cli.tui {
-        if let Some(selector) = &cli.session {
-            let _ = resolve_session(&snapshot, selector)?;
-        }
-        return crate::ui::run(snapshot, || build_snapshot(&cli));
+        let initial = match &cli.session {
+            Some(selector) => Some(resolve_session(&snapshot, selector)?.key.clone()),
+            None => None,
+        };
+        return crate::ui::run_with_initial(snapshot, initial, || build_snapshot(&cli));
     }
     if cli.json {
         println!("{}", format::json::render(&snapshot)?);

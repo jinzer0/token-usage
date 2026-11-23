@@ -109,7 +109,6 @@ pub fn with_commas(value: u64) -> String {
     out.chars().rev().collect()
 }
 
-#[allow(dead_code)]
 pub fn relative_time(at: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let delta = now.signed_duration_since(at);
     let secs = delta.num_seconds();
@@ -136,7 +135,6 @@ pub fn relative_time(at: DateTime<Utc>, now: DateTime<Utc>) -> String {
     }
 }
 
-#[allow(dead_code)]
 pub fn cache_hit_rate(cache_read: u64, input_total: u64) -> Option<String> {
     if input_total == 0 {
         None

@@ -7,7 +7,6 @@ use crate::ui::{
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
 };
@@ -15,7 +14,7 @@ use ratatui::{
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, _mode: LayoutMode) {
     let line = if app.search.mode == SearchMode::Editing {
         let mut spans = vec![
-            Span::styled(" Search: ", theme.key_hint()),
+            Span::styled(" Search: ", theme.hint_key()),
             Span::styled(app.search.query.clone(), theme.primary_text()),
             Span::raw("  "),
         ];
@@ -52,35 +51,48 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, _mode
         if has_filter {
             spans.push(Span::styled(
                 format!("Filter: /{} (Esc clear)", app.search.query),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                theme.hint_key(),
             ));
             spans.push(Span::styled(" · ", theme.muted_text()));
         }
         let pairs: &[(&str, &str)] =
-            if app.tab == ViewTab::Dates && (!has_filter || area.width >= 136) {
+            if app.tab == ViewTab::Models && (!has_filter || area.width >= 136) {
                 &[
-                    ("1/2", "tabs"),
+                    ("1-3", "tabs"),
+                    ("Tab", "pane"),
+                    ("jk", "move"),
+                    ("s", "sort"),
+                    ("c", "client"),
+                    ("f", "period"),
+                    ("/", "search"),
+                    ("v", "breakdown"),
+                    ("r", "reload"),
+                    ("?", "help"),
+                    ("q", "quit"),
+                ]
+            } else if app.tab == ViewTab::Dates && (!has_filter || area.width >= 136) {
+                &[
+                    ("1-3", "tabs"),
                     ("Tab", "pane"),
                     ("jk", "move"),
                     ("[/]", "dates"),
                     ("s", "sort"),
+                    ("c/f", "filter"),
                     ("d/p", "pin"),
                     ("/", "search"),
-                    ("v", "breakdown"),
-                    ("r", "reload"),
+                    ("v", "detail"),
+                    ("r", ""),
                     ("?", ""),
                     ("q", ""),
                 ]
             } else if area.width >= 100 && (!has_filter || area.width >= 136) {
                 &[
-                    ("1/2", "tabs"),
+                    ("1-3", "tabs"),
                     ("jk", "session"),
                     ("d", "dates"),
                     ("s", "sort"),
+                    ("c/f", "filter"),
                     ("/", "search"),
-                    ("J/K", "scroll"),
                     ("v", "breakdown"),
                     ("r", "reload"),
                     ("?", "help"),
@@ -88,9 +100,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, _mode
                 ]
             } else if area.width >= 100 {
                 &[
-                    ("1/2", "tabs"),
+                    ("1-3", "tabs"),
                     ("jk", "move"),
                     ("s", "sort"),
+                    ("c/f", "filter"),
                     ("v", "breakdown"),
                     ("r", "reload"),
                     ("?", "help"),
@@ -100,7 +113,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, _mode
                 &[
                     ("jk", ""),
                     ("d", "dates"),
-                    ("s", "sort"),
+                    ("c/f", "filter"),
                     ("?", "help"),
                     ("q", ""),
                 ]
@@ -116,14 +129,13 @@ fn push_hints(
     pairs: &[(&'static str, &'static str)],
     theme: &Theme,
 ) {
-    let label_style = Style::default().fg(Color::Gray);
     for (idx, (key, label)) in pairs.iter().enumerate() {
         if idx > 0 {
             spans.push(Span::styled(" · ", theme.muted_text()));
         }
-        spans.push(Span::styled(*key, theme.key_hint()));
+        spans.push(Span::styled(*key, theme.hint_key()));
         if !label.is_empty() {
-            spans.push(Span::styled(format!(" {label}"), label_style));
+            spans.push(Span::styled(format!(" {label}"), theme.hint_desc()));
         }
     }
 }
@@ -131,7 +143,7 @@ fn push_hints(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::TestBackend, style::Color};
 
     #[test]
     fn confirmed_search_shows_filter_badge_and_split_hint_styles() {

@@ -12,22 +12,21 @@ use chrono::Local;
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, mode: LayoutMode) {
+pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme, mode: LayoutMode) {
     let focused = app.focus == PaneFocus::Details;
     let border_style = if focused {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        theme.border_focused()
     } else {
         theme.border()
     };
+    let viewport_height = area.height.saturating_sub(2) as usize;
 
     if app.snapshot.sessions.is_empty() {
+        app.set_detail_metrics(0, viewport_height);
         let text = vec![
             Line::styled("No usage sessions found.", theme.title()),
             Line::raw(""),
@@ -46,6 +45,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, mode:
     }
 
     let Some(session) = app.selected_session() else {
+        app.set_detail_metrics(0, viewport_height);
         frame.render_widget(
             Paragraph::new("No matching sessions. Press Esc to clear search.").block(
                 Block::default()
@@ -63,7 +63,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, mode:
         if let Some(pos) = app.selected_filtered_position() {
             if !app.filtered_sessions.is_empty() {
                 let prefix = format!("[{}/{}] ", pos + 1, app.filtered_sessions.len());
-                let name_budget = max_title_width.saturating_sub(prefix.chars().count());
+                let name_budget = max_title_width.saturating_sub(format::display_width(&prefix));
                 format!(
                     "{prefix}{}",
                     format::truncate_ellipsis(raw_title, name_budget)
@@ -88,11 +88,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, mode:
         inner_width as usize,
     );
     let total_lines = wrapped_line_count(&lines, inner_width as usize);
+    app.set_detail_metrics(total_lines, viewport_height);
     let paragraph = Paragraph::new(lines)
         .scroll((app.detail_scroll.min(u16::MAX as usize) as u16, 0))
         .wrap(Wrap { trim: false });
 
-    let viewport_height = area.height.saturating_sub(2) as usize;
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
@@ -224,11 +224,7 @@ fn detail_lines(
         format!("Total {}", tokens.total_tokens),
         theme.number(),
     )];
-    if tokens.input_total > 0 {
-        let hit = format::percentage(
-            tokens.cache_read.min(tokens.input_total),
-            tokens.input_total,
-        );
+    if let Some(hit) = format::cache_hit_rate(tokens.cache_read, tokens.input_total) {
         total_spans.push(Span::styled(
             format!("  ·  Cache hit {hit}"),
             theme.muted_text(),
@@ -281,9 +277,9 @@ fn push_model(
     let name = format::truncate_ellipsis(&model.model, left_width);
     lines.push(Line::from(vec![
         Span::styled(name.clone(), theme.model_name()),
-        Span::raw(
-            " ".repeat(width.saturating_sub(name.chars().count() + total.len() + pct.len() + 2)),
-        ),
+        Span::raw(" ".repeat(
+            width.saturating_sub(format::display_width(&name) + total.len() + pct.len() + 2),
+        )),
         Span::styled(total, theme.number()),
         Span::raw(" "),
         Span::styled(pct, theme.percentage()),
@@ -592,7 +588,7 @@ mod tests {
                 render(
                     frame,
                     frame.area(),
-                    &app,
+                    &mut app,
                     &Theme::default(),
                     LayoutMode::Narrow,
                 )

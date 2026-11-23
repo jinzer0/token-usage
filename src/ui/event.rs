@@ -108,11 +108,11 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent, area: Rect) {
         MouseEventKind::Down(MouseButton::Left) => {
             if contains(l.header, col, row) && row == l.header.y {
                 let rel_x = col.saturating_sub(l.header.x);
-                if (14..25).contains(&rel_x) {
+                if (14..26).contains(&rel_x) {
                     app.switch_tab(ViewTab::Sessions);
-                } else if (25..36).contains(&rel_x) {
+                } else if (27..36).contains(&rel_x) {
                     app.switch_tab(ViewTab::Dates);
-                } else if (36..47).contains(&rel_x) {
+                } else if (37..47).contains(&rel_x) {
                     app.switch_tab(ViewTab::Models);
                 }
                 return;
@@ -123,7 +123,8 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent, area: Rect) {
                 app.focus = PaneFocus::Dates;
                 if inner_contains(r, col, row) {
                     let rel_y = (row - r.y - 1) as usize;
-                    if let Some(pos) = date_row_at(app, rel_y) {
+                    let inner_width = r.width.saturating_sub(2) as usize;
+                    if let Some(pos) = date_row_at(app, rel_y, inner_width) {
                         app.select_date_at(pos);
                     }
                 }
@@ -159,18 +160,18 @@ fn inner_contains(rect: Rect, col: u16, row: u16) -> bool {
     col > rect.x && col + 1 < rect.right() && row > rect.y && row + 1 < rect.bottom()
 }
 
-fn date_row_at(app: &App, rel_y: usize) -> Option<usize> {
+fn date_row_at(app: &App, rel_y: usize, inner_width: usize) -> Option<usize> {
     let pinned = app.pinned_session.is_some();
     let mut y = 0usize;
     for pos in app.date_list_state.offset()..app.visible_dates.len() {
         let index = app.visible_dates[pos];
         let date = app.snapshot.dates.get(index)?;
-        if app.date_tokens(index).is_none() {
+        let Some(tokens) = app.date_tokens(index) else {
             continue;
-        }
+        };
         let mut height = 2usize;
         if date.day.is_some()
-            && app
+            && let Some(previous) = app
                 .visible_dates
                 .get(pos + 1)
                 .and_then(|prev| {
@@ -181,9 +182,21 @@ fn date_row_at(app: &App, rel_y: usize) -> Option<usize> {
                         .map(|_| *prev)
                 })
                 .and_then(|prev| app.date_tokens(prev))
-                .is_some()
         {
-            height += 2;
+            let delta = i128::from(tokens.total_tokens) - i128::from(previous.total_tokens);
+            let magnitude = delta.unsigned_abs() as u64;
+            let delta_str = if delta > 0 {
+                format!("+{}", super::format::token_count(magnitude))
+            } else if delta < 0 {
+                format!("-{}", super::format::token_count(magnitude))
+            } else {
+                "+0".into()
+            };
+            let total_str = super::format::token_count(tokens.total_tokens);
+            let one_space_len = 2 + total_str.len() + 1 + delta_str.len();
+            if one_space_len > inner_width {
+                height += 1;
+            }
         }
         if pinned {
             height += 1;

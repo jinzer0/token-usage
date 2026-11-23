@@ -77,7 +77,6 @@ impl Theme {
     }
 }
 
-#[allow(dead_code)]
 impl Theme {
     pub fn tab_active(&self) -> Style {
         Style::default()
@@ -95,9 +94,7 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
     pub fn selected_row_unfocused(&self) -> Style {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        self.selected_row()
     }
     pub fn delta_positive(&self) -> Style {
         Style::default().fg(Color::Yellow)
