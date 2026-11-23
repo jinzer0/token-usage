@@ -20,6 +20,20 @@ where
         }
         return Ok(false);
     }
+    if app.period_input.editing {
+        match key.code {
+            KeyCode::Esc => app.cancel_period_input(),
+            KeyCode::Enter => app.confirm_period_input(),
+            KeyCode::Backspace => app.pop_period_digit(),
+            KeyCode::Char(ch)
+                if ch.is_ascii_digit() && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                app.push_period_digit(ch)
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
     if app.search.mode == SearchMode::Editing {
         match key.code {
             KeyCode::Esc => app.cancel_search(),
@@ -46,6 +60,7 @@ where
         KeyCode::Char('3') => app.switch_tab(ViewTab::Models),
         KeyCode::Char('c') => app.cycle_client_filter(),
         KeyCode::Char('f') => app.cycle_period_filter(),
+        KeyCode::Char('F') | KeyCode::Char('n') => app.start_period_input(),
         KeyCode::BackTab | KeyCode::Left => app.move_focus(-1),
         KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => app.move_focus(-1),
         KeyCode::Tab | KeyCode::Right | KeyCode::Enter => app.move_focus(1),
@@ -404,5 +419,33 @@ mod tests {
         assert_eq!(app.selected_model_position(), Some(2));
         handle_key(&mut app, key(KeyCode::Char('g')), &mut reload).unwrap();
         assert_eq!(app.selected_model_position(), Some(0));
+    }
+
+    #[test]
+    fn custom_period_input_accepts_digits_applies_on_enter_and_cancels_on_esc() {
+        let mut app = App::new(daily_test_snapshot([true; 3]));
+        let mut reload = || anyhow::bail!("unexpected reload");
+
+        // Trigger with 'n', ignore non-digits and navigation keys, apply 14d on Enter
+        assert!(!handle_key(&mut app, key(KeyCode::Char('n')), &mut reload).unwrap());
+        assert!(app.period_input.editing);
+        for ch in ['q', 's', 'x', '1', '4'] {
+            assert!(!handle_key(&mut app, key(KeyCode::Char(ch)), &mut reload).unwrap());
+        }
+        assert_eq!(app.period_input.query, "14");
+        assert!(!handle_key(&mut app, key(KeyCode::Enter), &mut reload).unwrap());
+        assert!(!app.period_input.editing);
+        assert_eq!(app.period_filter, PeriodFilter::CustomDays(14));
+
+        // Trigger with 'F' (pre-fills "14"), edit to "7", then Esc cancels without quitting
+        assert!(!handle_key(&mut app, key(KeyCode::Char('F')), &mut reload).unwrap());
+        assert_eq!(app.period_input.query, "14");
+        assert!(!handle_key(&mut app, key(KeyCode::Backspace), &mut reload).unwrap());
+        assert!(!handle_key(&mut app, key(KeyCode::Char('7')), &mut reload).unwrap());
+        assert_eq!(app.period_input.query, "17");
+        assert!(!handle_key(&mut app, key(KeyCode::Esc), &mut reload).unwrap());
+        assert!(!app.period_input.editing);
+        assert!(app.period_input.query.is_empty());
+        assert_eq!(app.period_filter, PeriodFilter::CustomDays(14));
     }
 }

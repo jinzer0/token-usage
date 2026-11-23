@@ -6,6 +6,7 @@ use crate::{
 };
 use chrono::{Duration, Local, NaiveDate};
 use ratatui::widgets::ListState;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -53,6 +54,7 @@ pub enum PeriodFilter {
     Today,
     SevenDays,
     ThirtyDays,
+    CustomDays(u32),
 }
 impl PeriodFilter {
     pub fn next(self) -> Self {
@@ -60,15 +62,16 @@ impl PeriodFilter {
             Self::All => Self::Today,
             Self::Today => Self::SevenDays,
             Self::SevenDays => Self::ThirtyDays,
-            Self::ThirtyDays => Self::All,
+            Self::ThirtyDays | Self::CustomDays(_) => Self::All,
         }
     }
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> Cow<'static, str> {
         match self {
-            Self::All => "All",
-            Self::Today => "Today",
-            Self::SevenDays => "7d",
-            Self::ThirtyDays => "30d",
+            Self::All => Cow::Borrowed("All"),
+            Self::Today => Cow::Borrowed("Today"),
+            Self::SevenDays => Cow::Borrowed("7d"),
+            Self::ThirtyDays => Cow::Borrowed("30d"),
+            Self::CustomDays(n) => Cow::Owned(format!("{n}d")),
         }
     }
     pub fn matches_day(self, day: Option<NaiveDate>, today: NaiveDate) -> bool {
@@ -77,8 +80,27 @@ impl PeriodFilter {
             Self::Today => day == Some(today),
             Self::SevenDays => day.is_some_and(|d| d >= today - Duration::days(6) && d <= today),
             Self::ThirtyDays => day.is_some_and(|d| d >= today - Duration::days(29) && d <= today),
+            Self::CustomDays(n) => {
+                n >= 1
+                    && day.is_some_and(|d| {
+                        d >= today - Duration::days(i64::from(n.saturating_sub(1))) && d <= today
+                    })
+            }
         }
     }
+}
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct PeriodInputState {
+    pub editing: bool,
+    pub query: String,
+}
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct SessionPeriodTotals {
+    pub today: u64,
+    pub seven_days: u64,
+    pub thirty_days: u64,
+    pub custom: Option<(u32, u64)>,
+    pub all: u64,
 }
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum SessionSort {
@@ -219,6 +241,7 @@ pub struct App {
     pub detail_viewport_height: usize,
     pub breakdown: bool,
     pub search: SearchState,
+    pub period_input: PeriodInputState,
     pub help_visible: bool,
     pub footer_error: Option<String>,
     pub footer_notice: Option<String>,
@@ -257,6 +280,7 @@ impl App {
             detail_viewport_height: 0,
             breakdown: false,
             search: SearchState::default(),
+            period_input: PeriodInputState::default(),
             help_visible: false,
             footer_error: None,
             footer_notice: None,
@@ -532,6 +556,88 @@ impl App {
         self.period_filter = self.period_filter.next();
         self.detail_scroll = 0;
         self.rebuild_filter();
+    }
+    pub fn start_period_input(&mut self) {
+        self.period_input.editing = true;
+        self.period_input.query = match self.period_filter {
+            PeriodFilter::CustomDays(n) => n.to_string(),
+            _ => String::new(),
+        };
+    }
+    pub fn push_period_digit(&mut self, ch: char) {
+        if ch.is_ascii_digit() && self.period_input.query.len() < 4 {
+            self.period_input.query.push(ch);
+        }
+    }
+    pub fn pop_period_digit(&mut self) {
+        self.period_input.query.pop();
+    }
+    pub fn cancel_period_input(&mut self) {
+        self.period_input = PeriodInputState::default();
+    }
+    pub fn confirm_period_input(&mut self) {
+        let trimmed = self.period_input.query.trim();
+        if trimmed.is_empty() {
+            self.period_filter = PeriodFilter::All;
+            self.detail_scroll = 0;
+            self.rebuild_filter();
+        } else if let Ok(n) = trimmed.parse::<u32>() {
+            if n >= 1 {
+                self.period_filter = PeriodFilter::CustomDays(n);
+                self.detail_scroll = 0;
+                self.rebuild_filter();
+                self.footer_notice = Some(format!("Period filter: last {n}d"));
+            } else {
+                self.footer_notice = Some("Enter at least 1 day".into());
+            }
+        }
+        self.period_input = PeriodInputState::default();
+    }
+    #[allow(dead_code)]
+    pub fn session_period_totals(&self, session_index: usize) -> Option<SessionPeriodTotals> {
+        self.session_period_totals_on(session_index, Local::now().date_naive())
+    }
+    pub fn session_period_totals_on(
+        &self,
+        session_index: usize,
+        today: NaiveDate,
+    ) -> Option<SessionPeriodTotals> {
+        let session = self.snapshot.sessions.get(session_index)?;
+        let custom_days = match self.period_filter {
+            PeriodFilter::CustomDays(n) => Some(n),
+            _ => None,
+        };
+        let mut today_sum = 0u64;
+        let mut seven_sum = 0u64;
+        let mut thirty_sum = 0u64;
+        let mut custom_sum = 0u64;
+        for bucket in &session.daily {
+            if bucket.record_count == 0 {
+                continue;
+            }
+            let tokens = bucket.tokens.total_tokens;
+            if PeriodFilter::Today.matches_day(bucket.day, today) {
+                today_sum = today_sum.saturating_add(tokens);
+            }
+            if PeriodFilter::SevenDays.matches_day(bucket.day, today) {
+                seven_sum = seven_sum.saturating_add(tokens);
+            }
+            if PeriodFilter::ThirtyDays.matches_day(bucket.day, today) {
+                thirty_sum = thirty_sum.saturating_add(tokens);
+            }
+            if let Some(n) = custom_days
+                && PeriodFilter::CustomDays(n).matches_day(bucket.day, today)
+            {
+                custom_sum = custom_sum.saturating_add(tokens);
+            }
+        }
+        Some(SessionPeriodTotals {
+            today: today_sum,
+            seven_days: seven_sum,
+            thirty_days: thirty_sum,
+            custom: custom_days.map(|n| (n, custom_sum)),
+            all: session.tokens.total_tokens,
+        })
     }
     pub fn move_down(&mut self) {
         self.move_active(1);
@@ -1817,5 +1923,128 @@ mod tests {
         assert_eq!(app.detail_scroll, 0);
         app.move_last();
         assert_eq!(app.detail_scroll, 10);
+    }
+
+    #[test]
+    fn custom_days_period_filter_matches_boundaries_and_cycles_to_all() {
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        let d3 = PeriodFilter::CustomDays(3);
+        assert_eq!(d3.label(), "3d");
+        assert_eq!(d3.next(), PeriodFilter::All);
+        assert!(d3.matches_day(Some(today), today));
+        assert!(d3.matches_day(Some(today - Duration::days(2)), today));
+        assert!(!d3.matches_day(Some(today - Duration::days(3)), today));
+        assert!(!d3.matches_day(Some(today + Duration::days(1)), today));
+        assert!(!d3.matches_day(None, today));
+
+        let d1 = PeriodFilter::CustomDays(1);
+        assert!(d1.matches_day(Some(today), today));
+        assert!(!d1.matches_day(Some(today - Duration::days(1)), today));
+        assert!(!PeriodFilter::CustomDays(0).matches_day(Some(today), today));
+    }
+
+    #[test]
+    fn period_input_confirm_cancel_zero_and_empty() {
+        let today = Local::now().date_naive();
+        let two_days_ago = (today - Duration::days(2))
+            .format("%Y-%m-%dT10:00:00Z")
+            .to_string();
+        let ten_days_ago = (today - Duration::days(10))
+            .format("%Y-%m-%dT10:00:00Z")
+            .to_string();
+        let mut app = App::new(test_snapshot(&[
+            ("s-2d", Gjc, Some(two_days_ago.as_str()), 200, true),
+            ("s-10d", Gjc, Some(ten_days_ago.as_str()), 500, true),
+        ]));
+
+        // Confirm valid custom days
+        app.detail_scroll = 5;
+        app.start_period_input();
+        assert!(app.period_input.editing);
+        assert!(app.period_input.query.is_empty());
+        app.push_period_digit('a'); // ignored
+        for ch in "12345".chars() {
+            app.push_period_digit(ch);
+        }
+        assert_eq!(app.period_input.query, "1234");
+        app.pop_period_digit();
+        app.pop_period_digit();
+        app.pop_period_digit();
+        app.pop_period_digit();
+        app.push_period_digit('5');
+        app.confirm_period_input();
+        assert!(!app.period_input.editing);
+        assert!(app.period_input.query.is_empty());
+        assert_eq!(app.period_filter, PeriodFilter::CustomDays(5));
+        assert_eq!(app.detail_scroll, 0);
+        assert_eq!(app.filtered_session_count(), 1);
+        assert_eq!(app.filtered_total_tokens(), 200);
+        assert_eq!(app.footer_notice.as_deref(), Some("Period filter: last 5d"));
+
+        // Start while CustomDays(5) pre-fills "5", cancel preserves filter
+        app.start_period_input();
+        assert_eq!(app.period_input.query, "5");
+        app.push_period_digit('0');
+        app.cancel_period_input();
+        assert!(!app.period_input.editing);
+        assert!(app.period_input.query.is_empty());
+        assert_eq!(app.period_filter, PeriodFilter::CustomDays(5));
+
+        // Zero days shows notice and preserves existing filter
+        app.start_period_input();
+        app.pop_period_digit();
+        app.push_period_digit('0');
+        app.confirm_period_input();
+        assert!(!app.period_input.editing);
+        assert!(app.period_input.query.is_empty());
+        assert_eq!(app.period_filter, PeriodFilter::CustomDays(5));
+        assert_eq!(app.footer_notice.as_deref(), Some("Enter at least 1 day"));
+
+        // Empty input resets to All
+        app.start_period_input();
+        app.pop_period_digit();
+        app.confirm_period_input();
+        assert!(!app.period_input.editing);
+        assert_eq!(app.period_filter, PeriodFilter::All);
+        assert_eq!(app.filtered_session_count(), 2);
+        assert_eq!(app.filtered_total_tokens(), 700);
+    }
+
+    #[test]
+    fn session_period_totals_on_computes_buckets_and_optional_custom() {
+        let mut app = App::new(test_snapshot(&[
+            ("multi", Gjc, Some("2026-03-15T12:00:00Z"), 10, true),
+            ("multi", Gjc, Some("2026-03-09T12:00:00Z"), 20, true),
+            ("multi", Gjc, Some("2026-03-02T12:00:00Z"), 40, true),
+            ("multi", Gjc, Some("2026-02-14T12:00:00Z"), 80, true),
+            ("multi", Gjc, Some("2026-02-01T12:00:00Z"), 160, true),
+            ("multi", Gjc, None, 320, true),
+        ]));
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        let totals = app.session_period_totals_on(0, today).unwrap();
+        assert_eq!(
+            totals,
+            SessionPeriodTotals {
+                today: 10,
+                seven_days: 30,
+                thirty_days: 150,
+                custom: None,
+                all: 630,
+            }
+        );
+
+        app.period_filter = PeriodFilter::CustomDays(14);
+        let totals_14d = app.session_period_totals_on(0, today).unwrap();
+        assert_eq!(
+            totals_14d,
+            SessionPeriodTotals {
+                today: 10,
+                seven_days: 30,
+                thirty_days: 150,
+                custom: Some((14, 70)),
+                all: 630,
+            }
+        );
+        assert!(app.session_period_totals_on(usize::MAX, today).is_none());
     }
 }
