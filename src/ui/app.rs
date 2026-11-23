@@ -83,7 +83,10 @@ impl PeriodFilter {
             Self::CustomDays(n) => {
                 n >= 1
                     && day.is_some_and(|d| {
-                        d >= today - Duration::days(i64::from(n.saturating_sub(1))) && d <= today
+                        let within_start = today
+                            .checked_sub_signed(Duration::days(i64::from(n.saturating_sub(1))))
+                            .is_none_or(|start| d >= start);
+                        within_start && d <= today
                     })
             }
         }
@@ -581,6 +584,7 @@ impl App {
             self.period_filter = PeriodFilter::All;
             self.detail_scroll = 0;
             self.rebuild_filter();
+            self.footer_notice = Some("Period filter: All".into());
         } else if let Ok(n) = trimmed.parse::<u32>() {
             if n >= 1 {
                 self.period_filter = PeriodFilter::CustomDays(n);

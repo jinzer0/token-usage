@@ -309,7 +309,9 @@ fn detail_lines_with_data(
             format::token_count(p.seven_days),
             format::token_count(p.thirty_days),
         );
-        if let Some((days, custom_total)) = p.custom {
+        if let Some((days, custom_total)) = p.custom
+            && !matches!(days, 1 | 7 | 30)
+        {
             period_text.push_str(&format!(" · {days}d {}", format::token_count(custom_total)));
         }
         period_text.push_str(&format!(" · all {}", format::token_count(p.all)));
