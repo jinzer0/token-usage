@@ -1,3 +1,4 @@
+use super::scrollable_detail;
 use crate::{
     aggregate::{ModelStats, SessionStats},
     domain::{Client, ReasoningEffort, TokenStats},
@@ -119,11 +120,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme, m
             inner_width as usize,
         ),
     };
-    let total_lines = wrapped_line_count(&lines, inner_width as usize);
-    app.set_detail_metrics(total_lines, viewport_height);
-    let paragraph = Paragraph::new(lines)
-        .scroll((app.detail_scroll.min(u16::MAX as usize) as u16, 0))
-        .wrap(Wrap { trim: false });
+    let paragraph = scrollable_detail(app, lines, inner_width, viewport_height);
+    let total_lines = app.detail_total_lines;
 
     let mut block = Block::default()
         .borders(Borders::ALL)
@@ -521,16 +519,6 @@ fn push_effort(
             theme.muted_text(),
         ));
     }
-}
-
-fn wrapped_line_count(lines: &[Line<'_>], width: usize) -> usize {
-    if width == 0 {
-        return 0;
-    }
-    lines
-        .iter()
-        .map(|line| line.width().max(1).div_ceil(width))
-        .sum()
 }
 
 fn effort_label(effort: &Option<ReasoningEffort>) -> String {

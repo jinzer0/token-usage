@@ -1,12 +1,14 @@
+use super::scrollable_detail;
 use crate::{
     domain::Client,
     ui::{
-        app::{App, ModelAggregateRow, PaneFocus},
+        app::{App, DailyTrendPoint, ModelAggregateRow, PaneFocus, PeriodFilter},
         format,
         layout::AppLayout,
         theme::Theme,
     },
 };
+use chrono::{Days, NaiveDate};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -49,16 +51,17 @@ fn render_trend_chart(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Them
         return;
     }
 
-    let start = app.trend_points.len().saturating_sub(inner_width);
-    let visible = &app.trend_points[start..];
-    let values: Vec<u64> = visible.iter().map(|p| p.tokens).collect();
+    let (values, avg) = chart_values(
+        &app.trend_points,
+        app.period_filter,
+        app.trend_today,
+        inner_width,
+    );
     let peak = app
         .trend_points
         .iter()
         .max_by_key(|p| (p.tokens, p.day))
         .expect("non-empty trend points");
-    let total: u128 = app.trend_points.iter().map(|p| u128::from(p.tokens)).sum();
-    let avg = (total / app.trend_points.len() as u128) as u64;
     let title = format::truncate_ellipsis(
         &format!(
             "Daily Trend · {scope} · peak {} {} · avg {}/d",
@@ -79,6 +82,41 @@ fn render_trend_chart(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Them
         .data(&values)
         .style(theme.chart_bar());
     frame.render_widget(sparkline, area);
+}
+
+// Points are sorted by calendar day. Materialize only columns the chart can
+// display, not an unbounded custom period or a large historical gap.
+fn chart_values(
+    points: &[DailyTrendPoint],
+    period: PeriodFilter,
+    today: NaiveDate,
+    width: usize,
+) -> (Vec<u64>, u64) {
+    let (Some(first), Some(last)) = (points.first(), points.last()) else {
+        return (Vec::new(), 0);
+    };
+    let (end, days) = match period {
+        PeriodFilter::All => (last.day, (last.day - first.day).num_days() as u64 + 1),
+        PeriodFilter::Today => (today, 1),
+        PeriodFilter::SevenDays => (today, 7),
+        PeriodFilter::ThirtyDays => (today, 30),
+        PeriodFilter::CustomDays(days) => (today, u64::from(days)),
+    };
+    if days == 0 {
+        return (Vec::new(), 0);
+    }
+
+    let total: u128 = points.iter().map(|p| u128::from(p.tokens)).sum();
+    let avg = (total / u128::from(days)) as u64;
+    let values = (0..days.min(width as u64))
+        .rev()
+        .map(|offset| {
+            end.checked_sub_days(Days::new(offset))
+                .and_then(|day| points.binary_search_by_key(&day, |p| p.day).ok())
+                .map_or(0, |index| points[index].tokens)
+        })
+        .collect();
+    (values, avg)
 }
 
 fn render_models_list(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
@@ -232,8 +270,8 @@ fn render_model_detail(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: 
         theme,
         inner_width as usize,
     );
-    let total_lines = wrapped_line_count(&lines, inner_width as usize);
-    app.set_detail_metrics(total_lines, viewport_height);
+    let paragraph = scrollable_detail(app, lines, inner_width, viewport_height);
+    let total_lines = app.detail_total_lines;
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(if app.focus == PaneFocus::Details {
@@ -260,21 +298,7 @@ fn render_model_detail(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: 
                 .style(theme.muted_text()),
         );
     }
-    let paragraph = Paragraph::new(lines)
-        .scroll((app.detail_scroll.min(u16::MAX as usize) as u16, 0))
-        .wrap(Wrap { trim: false })
-        .block(block);
-    frame.render_widget(paragraph, area);
-}
-
-fn wrapped_line_count(lines: &[Line<'_>], width: usize) -> usize {
-    if width == 0 {
-        return lines.len();
-    }
-    lines
-        .iter()
-        .map(|line| line.width().max(1).div_ceil(width))
-        .sum()
+    frame.render_widget(paragraph.block(block), area);
 }
 
 fn model_detail_lines(
@@ -443,4 +467,39 @@ fn format_client_tags(clients: &[Client]) -> String {
         .collect::<Vec<_>>()
         .join("/");
     format!("[{tags}]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chart_keeps_zero_usage_days_in_the_period_and_average() {
+        let today = NaiveDate::from_ymd_opt(2026, 11, 23).unwrap();
+        let points = [DailyTrendPoint {
+            day: today - Days::new(3),
+            tokens: 700,
+            record_count: 1,
+        }];
+
+        assert_eq!(
+            chart_values(&points, PeriodFilter::SevenDays, today, 10),
+            (vec![0, 0, 0, 700, 0, 0, 0], 100),
+        );
+        assert_eq!(
+            chart_values(&points, PeriodFilter::CustomDays(u32::MAX), today, 5),
+            (vec![0, 700, 0, 0, 0], 0),
+        );
+
+        let mut history = points.to_vec();
+        history.push(DailyTrendPoint {
+            day: today - Days::new(1),
+            tokens: 200,
+            record_count: 1,
+        });
+        assert_eq!(
+            chart_values(&history, PeriodFilter::All, today, 10),
+            (vec![700, 0, 200], 300),
+        );
+    }
 }

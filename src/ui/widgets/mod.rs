@@ -11,7 +11,22 @@ use crate::ui::{
     layout,
     theme::Theme,
 };
-use ratatui::{Frame, widgets::Paragraph};
+use ratatui::{
+    Frame,
+    text::Line,
+    widgets::{Paragraph, Wrap},
+};
+
+fn scrollable_detail<'a>(
+    app: &mut App,
+    lines: Vec<Line<'a>>,
+    inner_width: u16,
+    viewport_height: usize,
+) -> Paragraph<'a> {
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    app.set_detail_metrics(paragraph.line_count(inner_width), viewport_height);
+    paragraph.scroll((app.detail_scroll.min(u16::MAX as usize) as u16, 0))
+}
 
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let theme = Theme::default();
@@ -59,6 +74,23 @@ mod tests {
         scan::ParseResult,
     };
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn detail_scroll_counts_word_wrapping_and_reaches_last_line() {
+        use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+
+        let mut app = App::new(aggregate(vec![]).unwrap());
+        app.detail_scroll = 100;
+        let paragraph =
+            scrollable_detail(&mut app, vec![Line::from("aaaaaa bbbbbb cccccc")], 10, 2);
+        assert_eq!(app.detail_total_lines, 3);
+        assert_eq!(app.detail_scroll, 1);
+        let area = Rect::new(0, 0, 10, 2);
+        let mut buffer = Buffer::empty(area);
+        paragraph.render(area, &mut buffer);
+        let last_row: String = buffer.content()[10..].iter().map(|c| c.symbol()).collect();
+        assert!(last_row.contains("cccccc"));
+    }
 
     fn screen(terminal: &Terminal<TestBackend>) -> String {
         terminal

@@ -236,6 +236,7 @@ pub struct App {
     pub model_list_state: ListState,
     pub selected_model: Option<String>,
     pub trend_points: Vec<DailyTrendPoint>,
+    pub trend_today: NaiveDate,
     pub model_sort: ModelSort,
     pub detail_scope: DetailScope,
     pub detail_scroll: usize,
@@ -275,6 +276,7 @@ impl App {
             model_list_state: ListState::default(),
             selected_model: None,
             trend_points: Vec::new(),
+            trend_today: Local::now().date_naive(),
             model_sort: ModelSort::Tokens,
             detail_scope: DetailScope::All,
             detail_scroll: 0,
@@ -1130,6 +1132,7 @@ impl App {
         }
         self.model_list_state.select(self.selected_model_position());
 
+        self.trend_today = today;
         self.trend_points = trend_map
             .into_iter()
             .map(|(day, (tokens, record_count))| DailyTrendPoint {
