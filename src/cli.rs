@@ -5,13 +5,15 @@ use crate::{
     },
     diagnostics::Severity,
     domain::{Client, TokenStats},
-    format, sources,
+    format,
+    scan::ParseResult,
+    sources,
     time::{self, GroupBy},
 };
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, LocalResult, TimeZone, Utc};
 use clap::{Parser, ValueEnum};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, path::PathBuf, thread};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -95,24 +97,26 @@ pub fn validate(cli: &Cli) -> Result<()> {
 }
 
 pub fn build_snapshot(cli: &Cli) -> Result<AggregateSnapshot> {
-    let mut results = Vec::new();
-    if matches!(cli.client, ClientFilter::All | ClientFilter::Codex) {
+    let include_codex = matches!(cli.client, ClientFilter::All | ClientFilter::Codex);
+    let include_gjc = matches!(cli.client, ClientFilter::All | ClientFilter::Gjc);
+    let include_opencode = matches!(cli.client, ClientFilter::All | ClientFilter::Opencode);
+
+    let parse_codex = || -> Result<ParseResult> {
         let root = cli
             .codex_home
             .clone()
             .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".codex"));
-        results.push(sources::codex::parse(&root)?);
-    }
-    if matches!(cli.client, ClientFilter::All | ClientFilter::Gjc) {
+        sources::codex::parse(&root)
+    };
+    let parse_gjc = || -> Result<ParseResult> {
         let root = cli.gjc_home.clone().unwrap_or_else(|| {
             dirs::home_dir()
                 .unwrap_or_default()
                 .join(".gjc/agent/sessions")
         });
-        results.push(sources::gjc::parse(&root)?);
-    }
-    let include_opencode = matches!(cli.client, ClientFilter::All | ClientFilter::Opencode);
-    if include_opencode {
+        sources::gjc::parse(&root)
+    };
+    let parse_opencode = || -> Result<ParseResult> {
         let path = match &cli.opencode_db {
             Some(path) => path.clone(),
             None => sources::opencode::default_db_path()?,
@@ -125,8 +129,50 @@ pub fn build_snapshot(cli: &Cli) -> Result<AggregateSnapshot> {
                 }
             }
         }
-        results.push(result);
-    }
+        Ok(result)
+    };
+
+    let enabled_count =
+        usize::from(include_codex) + usize::from(include_gjc) + usize::from(include_opencode);
+    let results = if enabled_count <= 1 {
+        let mut results = Vec::with_capacity(enabled_count);
+        if include_codex {
+            results.push(parse_codex()?);
+        }
+        if include_gjc {
+            results.push(parse_gjc()?);
+        }
+        if include_opencode {
+            results.push(parse_opencode()?);
+        }
+        results
+    } else {
+        thread::scope(|scope| -> Result<Vec<ParseResult>> {
+            let codex_handle = include_codex.then(|| scope.spawn(parse_codex));
+            let gjc_handle = include_gjc.then(|| scope.spawn(parse_gjc));
+            let opencode_result = include_opencode.then(parse_opencode);
+
+            let mut results = Vec::with_capacity(enabled_count);
+            if let Some(handle) = codex_handle {
+                results.push(
+                    handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("Codex parser thread panicked"))??,
+                );
+            }
+            if let Some(handle) = gjc_handle {
+                results.push(
+                    handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("GJC parser thread panicked"))??,
+                );
+            }
+            if let Some(result) = opencode_result {
+                results.push(result?);
+            }
+            Ok(results)
+        })?
+    };
     let options = AggregateOptions {
         time_selection: time::build_selection(
             cli.today,
@@ -196,4 +242,54 @@ fn session_timeline_snapshot(
         diagnostics: snapshot.diagnostics.clone(),
         source_counts,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn parallel_all_client_scan_preserves_order_severity_upgrade_and_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex_home = dir.path().join("codex-missing");
+        let gjc_home = dir.path().join("gjc-missing");
+        let opencode_db = dir.path().join("opencode-missing.db");
+
+        let cli = Cli::try_parse_from([
+            "token-usage",
+            "--client",
+            "all",
+            "--codex-home",
+            codex_home.to_str().unwrap(),
+            "--gjc-home",
+            gjc_home.to_str().unwrap(),
+            "--opencode-db",
+            opencode_db.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        let snapshot = build_snapshot(&cli).unwrap();
+        assert_eq!(
+            snapshot.source_counts.missing_roots,
+            vec![codex_home.clone(), gjc_home.clone(), opencode_db]
+        );
+        assert_eq!(snapshot.diagnostics.len(), 1);
+        assert_eq!(snapshot.diagnostics[0].code, "OpenCodeMissingDatabase");
+        assert!(matches!(snapshot.diagnostics[0].severity, Severity::Error));
+
+        let memory_cli = Cli::try_parse_from([
+            "token-usage",
+            "--client",
+            "all",
+            "--codex-home",
+            codex_home.to_str().unwrap(),
+            "--gjc-home",
+            gjc_home.to_str().unwrap(),
+            "--opencode-db",
+            Path::new(":memory:").to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(build_snapshot(&memory_cli).is_err());
+    }
 }
