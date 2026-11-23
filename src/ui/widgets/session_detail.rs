@@ -84,6 +84,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme, m
     };
 
     let inner_width = area.width.saturating_sub(2);
+    let periods = if app.detail_scope == DetailScope::All {
+        app.session_period_totals(session_idx)
+    } else {
+        None
+    };
     let scoped_all = if app.detail_scope == DetailScope::All
         && app.period_filter != crate::ui::app::PeriodFilter::All
     {
@@ -98,6 +103,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme, m
             tokens,
             models.as_slice(),
             *record_count,
+            periods,
             theme,
             app.breakdown,
             mode,
@@ -106,6 +112,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme, m
         None => detail_lines(
             session,
             app.detail_scope,
+            periods,
             theme,
             app.breakdown,
             mode,
@@ -149,6 +156,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme, m
 fn detail_lines(
     session: &SessionStats,
     scope: DetailScope,
+    periods: Option<crate::ui::app::SessionPeriodTotals>,
     theme: &Theme,
     breakdown: bool,
     mode: LayoutMode,
@@ -185,6 +193,7 @@ fn detail_lines(
         tokens,
         models,
         record_count,
+        periods,
         theme,
         breakdown,
         mode,
@@ -199,6 +208,7 @@ fn detail_lines_with_data(
     tokens: &TokenStats,
     models: &[ModelStats],
     record_count: u64,
+    periods: Option<crate::ui::app::SessionPeriodTotals>,
     theme: &Theme,
     breakdown: bool,
     mode: LayoutMode,
@@ -250,6 +260,16 @@ fn detail_lines_with_data(
         ));
     }
 
+    if let Some(workspace) = &session.workspace {
+        let shortened = format::shorten_home(workspace);
+        let max_ws_len = width.saturating_sub(10).max(8);
+        let truncated_ws = format::truncate_ellipsis(&shortened, max_ws_len);
+        lines.push(Line::from(vec![
+            Span::styled("Workspace ", theme.muted_text()),
+            Span::styled(truncated_ws, theme.primary_text()),
+        ]));
+    }
+
     let time_line = match (session.last_used_at, session.started_at) {
         (Some(last), Some(started)) => Some(format!(
             "Last used {} · Started {}",
@@ -281,6 +301,23 @@ fn detail_lines_with_data(
         ));
     }
     lines.push(Line::from(total_spans));
+
+    if let Some(p) = periods {
+        let mut period_text = format!(
+            "today {} · 7d {} · 30d {}",
+            format::token_count(p.today),
+            format::token_count(p.seven_days),
+            format::token_count(p.thirty_days),
+        );
+        if let Some((days, custom_total)) = p.custom {
+            period_text.push_str(&format!(" · {days}d {}", format::token_count(custom_total)));
+        }
+        period_text.push_str(&format!(" · all {}", format::token_count(p.all)));
+        lines.push(Line::from(vec![
+            Span::styled("Periods  ", theme.muted_text()),
+            Span::styled(period_text, theme.primary_text()),
+        ]));
+    }
 
     if breakdown {
         push_exact_components(&mut lines, tokens, theme);
@@ -564,6 +601,7 @@ mod tests {
         let lines = detail_lines(
             &session,
             DetailScope::All,
+            None,
             &Theme::default(),
             false,
             LayoutMode::Wide,
@@ -587,11 +625,19 @@ mod tests {
         let session = &snapshot.sessions[0];
         let day = session.daily[0].day.unwrap();
         let text = |scope, breakdown, mode, width| {
-            detail_lines(session, scope, &Theme::default(), breakdown, mode, width)
-                .iter()
-                .map(|l| l.to_string())
-                .collect::<Vec<_>>()
-                .join("\n")
+            detail_lines(
+                session,
+                scope,
+                None,
+                &Theme::default(),
+                breakdown,
+                mode,
+                width,
+            )
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
         };
         let all = text(DetailScope::All, false, LayoutMode::Wide, 100);
         assert!(all.contains("day-old") && all.contains("day-new") && all.contains("day-unknown"));

@@ -404,13 +404,82 @@ mod tests {
         assert!(all_text.contains("ancient-model") && all_text.contains("today-model"));
 
         app.cycle_period_filter(); // Today
-        let today_text = screen(&draw(&mut app, 120, 24));
+        let today_term = draw(&mut app, 120, 24);
+        let today_text = screen(&today_term);
         assert!(
             today_text.contains("Total 250"),
             "today detail: {today_text}"
         );
         assert!(today_text.contains("today-model"));
         assert!(!today_text.contains("ancient-model"));
-        assert!(!today_text.contains("9.2K"));
+        let session_pane: String = today_term
+            .backend()
+            .buffer()
+            .content()
+            .chunks(120)
+            .flat_map(|row| row[..40].iter().map(|cell| cell.symbol()))
+            .collect();
+        assert!(session_pane.contains("250"), "session pane: {session_pane}");
+        assert!(
+            !session_pane.contains("9.2K"),
+            "session pane leaked lifetime total: {session_pane}"
+        );
+    }
+
+    #[test]
+    fn detail_displays_workspace_and_multi_period_summary_and_workspace_is_searchable() {
+        let now = chrono::Utc::now();
+        let d5 = now - chrono::Duration::days(5);
+        let d20 = now - chrono::Duration::days(20);
+        let d45 = now - chrono::Duration::days(45);
+        let mut result = ParseResult::empty(Client::Codex, "ws-period".into());
+        for (at, total) in [(now, 100), (d5, 200), (d20, 400), (d45, 800)] {
+            result.records.push(UsageRecord {
+                session_key: SessionKey {
+                    client: Client::Codex,
+                    id: SessionId("ws-sess".into()),
+                },
+                parent_session_key: None,
+                message_id: None,
+                source_path: "ws-period".into(),
+                source_line: None,
+                started_at: Some(at),
+                session_name: Some("Workspace Session".into()),
+                workspace: Some("/opt/projects/token-usage".into()),
+                model: "gpt-5".into(),
+                reasoning_effort: None,
+                tokens: TokenStats {
+                    total_tokens: total,
+                    ..Default::default()
+                },
+            });
+        }
+        let mut app = App::new(aggregate(vec![result]).unwrap());
+        let text = screen(&draw(&mut app, 140, 24));
+        assert!(
+            text.contains("Workspace /opt/projects/token-usage"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Periods  today 100 · 7d 300 · 30d 700 · all 1.5K"),
+            "{text}"
+        );
+
+        // Apply custom 14d filter via interactive period input
+        app.start_period_input();
+        app.push_period_digit('1');
+        app.push_period_digit('4');
+        app.confirm_period_input();
+        let custom_text = screen(&draw(&mut app, 140, 24));
+        assert!(custom_text.contains("14d 300"), "{custom_text}");
+        assert!(custom_text.contains("Total 300"), "{custom_text}");
+
+        // Search by workspace path matches session
+        app.start_search();
+        for ch in "projects/token-usage".chars() {
+            app.push_search_char(ch);
+        }
+        app.confirm_search();
+        assert_eq!(app.filtered_sessions.len(), 1);
     }
 }

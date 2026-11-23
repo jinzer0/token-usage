@@ -143,13 +143,11 @@ pub fn cache_hit_rate(cache_read: u64, input_total: u64) -> Option<String> {
     }
 }
 
-#[allow(dead_code)]
 pub fn shorten_home(path: &str) -> String {
     let home = dirs::home_dir();
     shorten_home_with(path, home.as_deref().and_then(|p| p.to_str()))
 }
 
-#[allow(dead_code)]
 fn shorten_home_with(path: &str, home: Option<&str>) -> String {
     let Some(home) = home else {
         return path.to_string();

@@ -42,7 +42,7 @@ SDIR=/path/to/specs
   --environment local \
   --spec-file "$SDIR/w1-spec.md" \
   --task-title "W1: <short title>" \
-  --worktree new-child --name w1-track-name \
+  --worktree new-child --base-branch main --name w1-track-name \
   --agent antigravity --model gemini-4-hydrogen-high --effort high \
   >"$d/w1.out" 2>"$d/w1.err" & p1=$!
 
@@ -50,7 +50,7 @@ SDIR=/path/to/specs
   --environment local \
   --spec-file "$SDIR/w2-spec.md" \
   --task-title "W2: <short title>" \
-  --worktree new-child --name w2-track-name \
+  --worktree new-child --base-branch main --name w2-track-name \
   --agent antigravity --model gemini-4-hydrogen-high --effort high \
   >"$d/w2.out" 2>"$d/w2.err" & p2=$!
 

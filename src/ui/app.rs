@@ -593,7 +593,6 @@ impl App {
         }
         self.period_input = PeriodInputState::default();
     }
-    #[allow(dead_code)]
     pub fn session_period_totals(&self, session_index: usize) -> Option<SessionPeriodTotals> {
         self.session_period_totals_on(session_index, Local::now().date_naive())
     }
@@ -1254,6 +1253,12 @@ fn matches_session(session: &SessionStats, query: &str) -> bool {
         || session.key.qualified().to_ascii_lowercase().contains(query)
         || session
             .name
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .contains(query)
+        || session
+            .workspace
             .as_deref()
             .unwrap_or_default()
             .to_ascii_lowercase()
