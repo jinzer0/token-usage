@@ -10,28 +10,36 @@ use chrono::Local;
 use ratatui::{
     Frame,
     layout::Rect,
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
 };
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+    let active_tab_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let inactive_tab_style = Style::default().fg(Color::Gray);
+
     let mut tabs = vec![
-        Span::styled(" token-usage  ", theme.title()),
+        Span::styled(" token-usage ", theme.title()),
+        Span::raw(" "),
         Span::styled(
-            "1 Sessions",
+            " 1 Sessions ",
             if app.tab == ViewTab::Sessions {
-                theme.selected_row()
+                active_tab_style
             } else {
-                theme.muted_text()
+                inactive_tab_style
             },
         ),
-        Span::raw("   "),
+        Span::raw(" "),
         Span::styled(
-            "2 Dates",
+            " 2 Dates ",
             if app.tab == ViewTab::Dates {
-                theme.selected_row()
+                active_tab_style
             } else {
-                theme.muted_text()
+                inactive_tab_style
             },
         ),
     ];
@@ -113,4 +121,26 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
         Paragraph::new(vec![Line::from(tabs), Line::from(summary)]),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn active_tab_has_cyan_pill_style() {
+        let app = App::new(crate::ui::app::daily_test_snapshot([true; 3]));
+        let mut terminal = Terminal::new(TestBackend::new(110, 2)).unwrap();
+        terminal
+            .draw(|frame| render(frame, frame.area(), &app, &Theme::default()))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let row0: String = (0..110).map(|x| buf[(x, 0)].symbol()).collect();
+        let s_pos = row0.find(" 1 Sessions ").unwrap();
+        let d_pos = row0.find(" 2 Dates ").unwrap();
+        assert_eq!(buf[(s_pos as u16 + 1, 0)].bg, Color::Cyan);
+        assert_eq!(buf[(s_pos as u16 + 1, 0)].fg, Color::Black);
+        assert_eq!(buf[(d_pos as u16 + 1, 0)].fg, Color::Gray);
+    }
 }
