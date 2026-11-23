@@ -2,6 +2,7 @@ mod date_list;
 mod footer;
 mod header;
 mod help;
+mod models_view;
 mod session_detail;
 mod session_list;
 
@@ -17,22 +18,32 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     let layout = layout::calculate(area, app.tab);
     if layout.mode == layout::LayoutMode::TooSmall {
-        let message = if app.tab == ViewTab::Dates {
-            "Enlarge terminal for Dates\nMinimum: 110x12 (three panes)\n1 Sessions · q quit"
-        } else {
-            "Enlarge terminal\nMinimum: 40x10\n2 Dates needs 110x12 · q quit"
+        let message = match app.tab {
+            ViewTab::Dates => {
+                "Enlarge terminal for Dates\nMinimum: 110x12 (three panes)\n1 Sessions · 3 Models · q quit"
+            }
+            ViewTab::Models => {
+                "Enlarge terminal for Models\nMinimum: 80x14\n3 Models needs 80x14 · 1 Sessions · q quit"
+            }
+            ViewTab::Sessions => {
+                "Enlarge terminal\nMinimum: 40x10\n2 Dates needs 110x12 · 3 Models needs 80x14 · q quit"
+            }
         };
         frame.render_widget(Paragraph::new(message), area);
         return;
     }
     header::render(frame, layout.header, app, &theme);
-    if let Some(dates) = layout.dates {
-        date_list::render(frame, dates, app, &theme);
+    if app.tab == ViewTab::Models {
+        models_view::render(frame, layout, app, &theme);
+    } else {
+        if let Some(dates) = layout.dates {
+            date_list::render(frame, dates, app, &theme);
+        }
+        if let Some(sessions) = layout.sessions {
+            session_list::render(frame, sessions, app, &theme);
+        }
+        session_detail::render(frame, layout.detail, app, &theme, layout.mode);
     }
-    if let Some(sessions) = layout.sessions {
-        session_list::render(frame, sessions, app, &theme);
-    }
-    session_detail::render(frame, layout.detail, app, &theme, layout.mode);
     footer::render(frame, layout.footer, app, &theme, layout.mode);
     if app.help_visible {
         help::render(frame, area, &theme);
@@ -318,5 +329,41 @@ mod tests {
         app.footer_notice = Some("Date gone; selection recovered".into());
         let text = screen(&draw(&mut app, 110, 12));
         assert!(text.contains("Date gone") && text.contains("q quit"));
+    }
+
+    #[test]
+    fn models_tab_renders_trend_chart_list_detail_and_clamps_scroll() {
+        let mut app = App::new(crate::ui::app::daily_test_snapshot([true; 3]));
+        app.switch_tab(ViewTab::Models);
+
+        let too_small = screen(&draw(&mut app, 79, 14));
+        assert!(too_small.contains("3 Models needs 80x14"));
+
+        let text = screen(&draw(&mut app, 120, 30));
+        for expected in [
+            "Daily Trend",
+            "All / All",
+            "peak 2026-03-11 300",
+            "avg 200/d",
+            "Models (3) · Tokens",
+            "day-unknown",
+            "day-new",
+            "day-old",
+            "Cache hit rate",
+            "Effort Breakdown",
+            "Top Sessions",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+
+        // Scroll past max gets clamped by render metrics
+        app.detail_scroll = 9999;
+        draw(&mut app, 120, 16);
+        assert_eq!(app.detail_scroll, app.detail_max_scroll);
+
+        // Select second model and verify detail updates
+        app.select_model_at(1);
+        let text = screen(&draw(&mut app, 120, 30));
+        assert!(text.contains("Total 300 (300)"));
     }
 }
