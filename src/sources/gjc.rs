@@ -152,8 +152,9 @@ fn parse_file(path: &Path) -> Result<FileOutput> {
         line_no += 1;
         output.lines_read += 1;
 
-        let parsed: GjcLine = match serde_json::from_str(&line) {
-            Ok(v) => v,
+        let parsed = match serde_json::from_str::<OptGjcLine>(&line) {
+            Ok(OptGjcLine(Some(v))) => v,
+            Ok(OptGjcLine(None)) => continue,
             Err(e) => {
                 output.records_skipped += 1;
                 output.diagnostics.push(Diagnostic::warning(
@@ -423,6 +424,10 @@ struct GjcLine {
     #[serde(rename = "createdAt", default, deserialize_with = "opt_string")]
     created_at_camel: Option<String>,
 }
+
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct OptGjcLine(#[serde(deserialize_with = "opt_struct")] Option<GjcLine>);
 
 impl GjcLine {
     fn typ(&self) -> Option<&str> {
