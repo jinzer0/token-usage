@@ -55,6 +55,7 @@ fn open_readonly(path: &Path) -> Result<Connection> {
     if !connection.is_readonly("main")? {
         bail!("OpenCode database connection is not read-only");
     }
+    connection.pragma_update(None, "cache_size", -64000)?;
     Ok(connection)
 }
 
@@ -232,7 +233,8 @@ fn read_database(path: &Path, result: &mut ParseResult) -> Result<()> {
     let mut missing_sessions = HashSet::new();
     // -> returns the original JSON numeric text, not SQLite's signed i64/REAL
     // coercion. Every JSON operation is behind json_valid, and only scalars
-    // cross into Rust (never message.data, token objects, or parts).
+    // cross into Rust (never message.data, token objects, or parts). Keep the
+    // query flattenable so SQLite does not accumulate a table of payloads.
     let numeric_paths = [
         "$.time.created",
         "$.tokens.input",
@@ -242,21 +244,31 @@ fn read_database(path: &Path, result: &mut ParseResult) -> Result<()> {
         "$.tokens.cache.write",
     ];
     let mut sql = String::from(
-        "SELECT id, session_id, json_valid(data), \
-        CASE WHEN json_valid(data) THEN CASE WHEN json_type(data, '$.role') = 'text' THEN json_extract(data, '$.role') END END, \
-        CASE WHEN json_valid(data) THEN CASE WHEN json_type(data, '$.providerID') = 'text' THEN json_extract(data, '$.providerID') END END, \
-        CASE WHEN json_valid(data) THEN CASE WHEN json_type(data, '$.modelID') = 'text' THEN json_extract(data, '$.modelID') END END",
+        "WITH checked AS ( \
+            SELECT id, session_id, data, \
+                json_valid(data) AS valid, \
+                CASE WHEN json_valid(data) THEN CASE WHEN json_type(data, '$.role') = 'text' THEN json_extract(data, '$.role') END END AS role \
+            FROM message \
+        ) \
+        SELECT id, session_id, valid, role, \
+        CASE WHEN valid THEN CASE WHEN json_type(data, '$.providerID') = 'text' THEN json_extract(data, '$.providerID') END END, \
+        CASE WHEN valid THEN CASE WHEN json_type(data, '$.modelID') = 'text' THEN json_extract(data, '$.modelID') END END",
     );
     for field in numeric_paths {
-        sql.push_str(&format!(", CASE WHEN json_valid(data) THEN CASE WHEN json_type(data, '{field}') IN ('integer', 'real') THEN data -> '{field}' END END"));
+        sql.push_str(&format!(
+            ", CASE WHEN valid THEN CASE WHEN json_type(data, '{field}') IN ('integer', 'real') THEN data -> '{field}' END END"
+        ));
     }
-    sql.push_str(", CASE WHEN json_valid(data) THEN CASE \
-        WHEN json_type(data, '$.tokens.total') IN ('integer', 'real') THEN data -> '$.tokens.total' \
-        WHEN json_type(data, '$.tokens.total') != 'null' THEN 'null' END END, \
-        CASE WHEN json_valid(data) THEN \
-        (json_type(data, '$.time.completed') IN ('integer', 'real') OR \
-         COALESCE(json_type(data, '$.finish') != 'null', 0) OR \
-         COALESCE(json_type(data, '$.error') != 'null', 0)) ELSE 0 END FROM message");
+    sql.push_str(
+        ", CASE WHEN valid THEN CASE \
+            WHEN json_type(data, '$.tokens.total') IN ('integer', 'real') THEN data -> '$.tokens.total' \
+            WHEN json_type(data, '$.tokens.total') != 'null' THEN 'null' END END, \
+        CASE WHEN valid THEN \
+            (json_type(data, '$.time.completed') IN ('integer', 'real') OR \
+             COALESCE(json_type(data, '$.finish') != 'null', 0) OR \
+             COALESCE(json_type(data, '$.error') != 'null', 0)) ELSE 0 END \
+        FROM checked WHERE NOT valid OR role IS NOT 'user'",
+    );
     {
         let mut statement = transaction.prepare(&sql)?;
         let mut rows = statement.query([])?;
@@ -845,5 +857,75 @@ mod tests {
         assert_eq!(minimal.records.len(), 1);
         assert!(minimal.diagnostics.is_empty());
         assert_eq!(minimal.records[0].workspace, None);
+    }
+
+    #[test]
+    fn user_messages_are_skipped_without_diagnostics_while_malformed_and_invalid_roles_diagnose() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("role-filter.db");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE session(id TEXT PRIMARY KEY, parent_id TEXT, title TEXT); \
+             CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT); \
+             INSERT INTO session VALUES ('s1', NULL, 'Session 1');",
+        )
+        .unwrap();
+
+        let cases = [
+            ("u1", r#"{"role":"user","time":{"created":1000}}"#),
+            (
+                "u2",
+                r#"{"role":"user","providerID":"p","modelID":"m","tokens":{"input":99,"output":99,"reasoning":0,"cache":{"read":0,"write":0}}}"#,
+            ),
+            ("malformed-1", "{"),
+            ("malformed-2", r#"{"role":"user""#),
+            ("malformed-3", ""),
+            (
+                "role-missing",
+                r#"{"providerID":"p","modelID":"m","time":{"created":1000},"tokens":{"input":1,"output":1,"reasoning":0,"cache":{"read":0,"write":0}}}"#,
+            ),
+            ("role-null", r#"{"role":null}"#),
+            ("role-num", r#"{"role":42}"#),
+            ("role-unknown", r#"{"role":"tool"}"#),
+            (
+                "assistant-ok",
+                r#"{"role":"assistant","providerID":"p","modelID":"m","time":{"created":1000},"tokens":{"input":2,"output":3,"reasoning":1,"cache":{"read":0,"write":0}}}"#,
+            ),
+        ];
+        for (id, data) in cases {
+            db.execute(
+                "INSERT INTO message VALUES (?1, 's1', 1000, ?2)",
+                (id, data),
+            )
+            .unwrap();
+        }
+        drop(db);
+
+        let result = parse(&path).unwrap();
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(
+            result.records[0].message_id.as_ref().unwrap().0,
+            "assistant-ok"
+        );
+        assert_eq!(result.records[0].tokens.total_tokens, 6);
+        assert_eq!(result.summary.records_emitted, 1);
+        assert_eq!(result.summary.records_skipped, 7);
+        assert_eq!(result.diagnostics.len(), 7);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == "OpenCodeMalformedMessage")
+                .count(),
+            3
+        );
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == "OpenCodeInvalidRole")
+                .count(),
+            4
+        );
     }
 }
