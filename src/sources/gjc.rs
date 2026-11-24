@@ -229,7 +229,7 @@ fn parse_file(path: &Path) -> Result<FileOutput> {
             }
             continue;
         }
-        let msg = parsed.message.as_ref();
+        let msg = parsed.message.value.as_ref();
         let role = msg
             .and_then(|m| m.role.as_deref())
             .or(parsed.role.as_deref());
@@ -254,10 +254,15 @@ fn parse_file(path: &Path) -> Result<FileOutput> {
             ));
             continue;
         };
-        let msg_id = msg
-            .and_then(GjcMessage::msg_id)
-            .or_else(|| parsed.top_msg_id())
-            .map(str::to_string);
+        // A flat record is itself the message; a present nested field instead
+        // gives the outer record envelope precedence only as a fallback.
+        let msg_id = if parsed.message.present {
+            msg.and_then(GjcMessage::msg_id)
+                .or_else(|| parsed.top_msg_id())
+        } else {
+            parsed.id.as_deref().or_else(|| parsed.top_msg_id())
+        }
+        .map(str::to_string);
         let key = msg_id.clone().unwrap_or_else(|| {
             format!(
                 "{}:{}:{}:{}",
@@ -405,8 +410,8 @@ struct GjcLine {
     thinking_level_camel: Option<String>,
     #[serde(default, deserialize_with = "opt_string")]
     level: Option<String>,
-    #[serde(default, deserialize_with = "opt_struct")]
-    message: Option<GjcMessage>,
+    #[serde(default, deserialize_with = "deserialize_message_field")]
+    message: GjcMessageField,
     #[serde(default, deserialize_with = "opt_string")]
     role: Option<String>,
     #[serde(default, deserialize_with = "opt_struct")]
@@ -498,6 +503,24 @@ impl GjcLine {
     fn timestamp(&self) -> Option<&str> {
         first_str(&[&self.timestamp, &self.created_at, &self.created_at_camel])
     }
+}
+
+#[derive(Default)]
+struct GjcMessageField {
+    present: bool,
+    value: Option<GjcMessage>,
+}
+
+fn deserialize_message_field<'de, D>(
+    deserializer: D,
+) -> std::result::Result<GjcMessageField, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(GjcMessageField {
+        present: true,
+        value: opt_struct(deserializer)?,
+    })
 }
 
 #[derive(Deserialize, Default)]
@@ -916,6 +939,58 @@ mod tests {
     fn normalize_usage_value(value: Value) -> Result<TokenStats> {
         let usage: UsageObject = serde_json::from_value(value)?;
         normalize_usage(&usage)
+    }
+
+    #[test]
+    fn assistant_message_ids_keep_flat_and_nested_dedup_precedence() {
+        let root = tempfile::tempdir().unwrap();
+        let usage = json!({"input":3,"output":2});
+        let rows = [
+            json!({"type":"assistant","id":"flat-a","message_id":"shared","model":"m","usage":usage}),
+            json!({"type":"assistant","id":"flat-b","message_id":"shared","model":"m","usage":usage}),
+            json!({"type":"assistant","id":"flat-a","message_id":"other","model":"m","usage":usage}),
+            json!({"type":"assistant","id":"outer-a","message_id":"flat-b","message":{"id":"nested","message_id":"alias","model":"m","usage":usage}}),
+            json!({"type":"assistant","id":"outer-b","message_id":"fallback","message":{"model":"m","usage":usage}}),
+            json!({"type":"assistant","id":"outer-c","messageId":"non-object-fallback","message":null,"model":"m","usage":usage}),
+        ];
+        let fixture = rows
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(root.path().join("session.jsonl"), fixture).unwrap();
+
+        let result = parse(root.path()).unwrap();
+        let ids: Vec<_> = result
+            .records
+            .iter()
+            .map(|r| r.message_id.as_ref().unwrap().0.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "flat-a",
+                "flat-b",
+                "nested",
+                "fallback",
+                "non-object-fallback"
+            ]
+        );
+        assert_eq!(result.summary.records_skipped, 1);
+        assert_eq!(
+            result
+                .records
+                .iter()
+                .map(|r| r.tokens.total_tokens)
+                .sum::<u64>(),
+            25
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "GjcDuplicateMessageSkipped")
+        );
     }
 
     #[test]
