@@ -27,6 +27,14 @@ pub struct ModelStats {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct ModelTotalStats {
+    pub model: String,
+    pub tokens: TokenStats,
+    pub record_count: u64,
+    pub session_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct SessionStats {
     pub key: SessionKey,
     pub parent: Option<SessionKey>,
@@ -53,6 +61,7 @@ pub struct SessionDayStats {
 pub struct AggregateSnapshot {
     pub generated_at: DateTime<Utc>,
     pub totals: TokenStats,
+    pub models: Vec<ModelTotalStats>,
     pub sessions: Vec<SessionStats>,
     #[serde(skip_serializing)]
     pub dates: Vec<DateStats>,
@@ -251,9 +260,11 @@ pub fn aggregate_with_options(
             });
         }
     }
+    let models = aggregate_models(&sessions)?;
     Ok(AggregateSnapshot {
         generated_at: Utc::now(),
         totals,
+        models,
         sessions,
         dates: dates.into_values().rev().collect(),
         timeline: timeline.into_values().collect(),
@@ -261,6 +272,44 @@ pub fn aggregate_with_options(
         diagnostics,
         source_counts,
     })
+}
+
+fn aggregate_models(sessions: &[SessionStats]) -> Result<Vec<ModelTotalStats>> {
+    let mut by_model: BTreeMap<String, ModelTotalStats> = BTreeMap::new();
+    for session in sessions {
+        for model_stat in &session.models {
+            let entry =
+                by_model
+                    .entry(model_stat.model.clone())
+                    .or_insert_with(|| ModelTotalStats {
+                        model: model_stat.model.clone(),
+                        tokens: TokenStats::default(),
+                        record_count: 0,
+                        session_count: 0,
+                    });
+            entry
+                .tokens
+                .checked_add_assign(&model_stat.tokens)
+                .context("snapshot model totals")?;
+            checked_count(
+                &mut entry.record_count,
+                model_stat.record_count,
+                "snapshot model records",
+            )?;
+            entry.session_count = entry
+                .session_count
+                .checked_add(1)
+                .context("snapshot model session count")?;
+        }
+    }
+    let mut models: Vec<_> = by_model.into_values().collect();
+    models.sort_by(|a, b| {
+        b.tokens
+            .total_tokens
+            .cmp(&a.tokens.total_tokens)
+            .then_with(|| a.model.cmp(&b.model))
+    });
+    Ok(models)
 }
 
 fn rollup_client(client: Client) -> bool {
@@ -1042,5 +1091,200 @@ mod tests {
             snap2.sessions[0].workspace.as_deref(),
             Some("/work/root-dir")
         );
+    }
+
+    #[test]
+    fn top_level_models_merge_across_sessions_and_efforts_ignoring_effort() {
+        let mut r1 = fixture_record(
+            Client::Gjc,
+            "s1",
+            None,
+            TokenStats {
+                input_uncached: 50,
+                input_total: 70,
+                cache_read: 15,
+                cache_write: 5,
+                output_total: 30,
+                reasoning_known: 10,
+                reasoning_has_unknown: false,
+                total_tokens: 100,
+            },
+        );
+        r1.model = "gpt-5".into();
+        r1.reasoning_effort = Some(ReasoningEffort::High);
+
+        let mut r2 = fixture_record(
+            Client::Gjc,
+            "s1",
+            None,
+            TokenStats {
+                input_uncached: 20,
+                input_total: 25,
+                cache_read: 5,
+                cache_write: 0,
+                output_total: 15,
+                reasoning_known: 0,
+                reasoning_has_unknown: true,
+                total_tokens: 40,
+            },
+        );
+        r2.model = "gpt-5".into();
+        r2.reasoning_effort = Some(ReasoningEffort::Low);
+
+        let mut r_child = fixture_record(Client::Gjc, "s1-child", None, field_tokens(6, 10));
+        r_child.model = "gpt-5".into();
+        r_child.reasoning_effort = Some(ReasoningEffort::Medium);
+
+        let mut r3 = fixture_record(Client::Codex, "s2", None, field_tokens(6, 60));
+        r3.model = "gpt-5".into();
+        r3.reasoning_effort = None;
+
+        let mut r4 = fixture_record(Client::Codex, "s2", None, field_tokens(6, 50));
+        r4.model = "claude-sonnet".into();
+        r4.reasoning_effort = Some(ReasoningEffort::Medium);
+
+        let mut gjc_res = fixture(vec![r1, r2, r_child]);
+        gjc_res.session_metadata = vec![
+            metadata(Client::Gjc, "s1", &[], Some("S1")),
+            metadata(Client::Gjc, "s1-child", &["s1"], Some("S1 Child")),
+        ];
+        let codex_res = ParseResult {
+            records: vec![r3, r4],
+            ..ParseResult::empty(Client::Codex, "codex-fixture".into())
+        };
+
+        let snapshot = aggregate(vec![gjc_res, codex_res]).unwrap();
+        assert_eq!(snapshot.models.len(), 2);
+
+        let gpt5 = &snapshot.models[0];
+        assert_eq!(gpt5.model, "gpt-5");
+        assert_eq!(gpt5.record_count, 4);
+        assert_eq!(gpt5.session_count, 2);
+        assert_eq!(
+            gpt5.tokens,
+            TokenStats {
+                input_uncached: 70,
+                input_total: 95,
+                cache_read: 20,
+                cache_write: 5,
+                output_total: 45,
+                reasoning_known: 10,
+                reasoning_has_unknown: true,
+                total_tokens: 210,
+            }
+        );
+
+        let claude = &snapshot.models[1];
+        assert_eq!(claude.model, "claude-sonnet");
+        assert_eq!(claude.record_count, 1);
+        assert_eq!(claude.session_count, 1);
+        assert_eq!(claude.tokens.total_tokens, 50);
+
+        let json_str = serde_json::to_string(&snapshot).unwrap();
+        let totals_pos = json_str.find("\"totals\":").unwrap();
+        let models_pos = json_str.find("\"models\":").unwrap();
+        let sessions_pos = json_str.find("\"sessions\":").unwrap();
+        assert!(totals_pos < models_pos && models_pos < sessions_pos);
+
+        let json_val: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        for model_entry in json_val["models"].as_array().unwrap() {
+            assert!(model_entry.get("efforts").is_none());
+        }
+    }
+
+    #[test]
+    fn top_level_models_respect_time_filtering() {
+        let t_old: DateTime<Utc> = "2026-03-01T12:00:00Z".parse().unwrap();
+        let t_in: DateTime<Utc> = "2026-03-10T12:00:00Z".parse().unwrap();
+        let t_after: DateTime<Utc> = "2026-03-20T12:00:00Z".parse().unwrap();
+
+        let mut old_only = fixture_record(Client::Gjc, "s-old", Some(t_old), field_tokens(6, 500));
+        old_only.model = "old-only-model".into();
+
+        let mut in_window_1 = fixture_record(Client::Gjc, "s1", Some(t_in), field_tokens(6, 30));
+        in_window_1.model = "shared-model".into();
+
+        let mut out_window_2 =
+            fixture_record(Client::Gjc, "s2", Some(t_after), field_tokens(6, 900));
+        out_window_2.model = "shared-model".into();
+
+        let mut missing_ts = fixture_record(Client::Gjc, "s3", None, field_tokens(6, 200));
+        missing_ts.model = "missing-ts-model".into();
+
+        let snapshot = aggregate_with_options(
+            vec![fixture(vec![
+                old_only,
+                in_window_1,
+                out_window_2,
+                missing_ts,
+            ])],
+            &AggregateOptions {
+                time_selection: TimeSelection {
+                    since: Some(t_in),
+                    until: Some(t_in + Duration::days(1)),
+                },
+                group_by: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.models.len(), 1);
+        assert_eq!(snapshot.models[0].model, "shared-model");
+        assert_eq!(snapshot.models[0].tokens.total_tokens, 30);
+        assert_eq!(snapshot.models[0].record_count, 1);
+        assert_eq!(snapshot.models[0].session_count, 1);
+        assert_eq!(snapshot.totals.total_tokens, 30);
+    }
+
+    #[test]
+    fn top_level_models_sort_deterministically_and_propagate_overflow() {
+        let mut r_beta = fixture_record(Client::Gjc, "s1", None, field_tokens(6, 50));
+        r_beta.model = "beta".into();
+        let mut r_alpha = fixture_record(Client::Gjc, "s2", None, field_tokens(6, 50));
+        r_alpha.model = "alpha".into();
+        let mut r_zeta = fixture_record(Client::Gjc, "s3", None, field_tokens(6, 100));
+        r_zeta.model = "zeta".into();
+
+        let snapshot = aggregate(vec![fixture(vec![r_beta, r_alpha, r_zeta])]).unwrap();
+        let names: Vec<&str> = snapshot.models.iter().map(|m| m.model.as_str()).collect();
+        assert_eq!(names, vec!["zeta", "alpha", "beta"]);
+
+        // Overflow propagated through aggregate
+        let mut o1 = fixture_record(Client::Gjc, "o1", None, field_tokens(6, u64::MAX));
+        o1.model = "same".into();
+        let mut o2 = fixture_record(Client::Gjc, "o2", None, field_tokens(6, 1));
+        o2.model = "same".into();
+        let err = aggregate(vec![fixture(vec![o1, o2])]).unwrap_err();
+        assert!(format!("{err:#}").contains("total_tokens"));
+
+        // Direct aggregate_models check for token overflow context and record count overflow
+        let mk_session = |id: &str, total: u64, records: u64| SessionStats {
+            key: SessionKey {
+                client: Client::Gjc,
+                id: SessionId(id.into()),
+            },
+            parent: None,
+            name: None,
+            workspace: None,
+            started_at: None,
+            last_used_at: None,
+            tokens: field_tokens(6, total),
+            models: vec![ModelStats {
+                model: "same".into(),
+                tokens: field_tokens(6, total),
+                efforts: Vec::new(),
+                record_count: records,
+            }],
+            record_count: records,
+            daily: Vec::new(),
+        };
+        let token_err =
+            aggregate_models(&[mk_session("a", u64::MAX, 1), mk_session("b", 1, 1)]).unwrap_err();
+        assert_eq!(token_err.to_string(), "snapshot model totals");
+        assert!(format!("{token_err:#}").contains("total_tokens"));
+
+        let record_err =
+            aggregate_models(&[mk_session("a", 1, u64::MAX), mk_session("b", 1, 1)]).unwrap_err();
+        assert!(record_err.to_string().contains("snapshot model records"));
     }
 }

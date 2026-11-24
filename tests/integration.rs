@@ -1443,15 +1443,20 @@ fn daily_session_three_sources_root_identity_partition_and_json_shape() {
     }
 
     let json = serde_json::to_value(&snapshot).unwrap();
-    assert_eq!(json.as_object().unwrap().len(), 7);
+    assert_eq!(json.as_object().unwrap().len(), 8);
     assert_eq!(
         json["totals"],
         serde_json::to_value(&snapshot.totals).unwrap()
+    );
+    assert_eq!(
+        json["models"],
+        serde_json::to_value(&snapshot.models).unwrap()
     );
     assert!(json.get("dates").is_none());
     for field in [
         "generated_at",
         "totals",
+        "models",
         "sessions",
         "timeline",
         "periods",
@@ -1906,4 +1911,107 @@ fn cli_json_and_detail_include_workspace_for_codex_and_gjc() {
         .assert()
         .success()
         .stdout(predicates::str::contains("workspace /work/gjc-app"));
+}
+
+#[test]
+fn cli_json_since_7d_includes_scoped_top_level_models_without_efforts() {
+    use chrono::Duration;
+    use serde_json::json;
+
+    let dir = tempdir().unwrap();
+    let now = Utc::now();
+    let recent_1 = (now - Duration::days(1)).to_rfc3339();
+    let recent_2 = (now - Duration::hours(12)).to_rfc3339();
+    let old = (now - Duration::days(30)).to_rfc3339();
+
+    fs::write(
+        dir.path().join("alpha.jsonl"),
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            json!({"type":"header","id":"alpha","title":"Alpha"}),
+            json!({"type":"thinking_level_change","effort":"high"}),
+            json!({"type":"message","id":"a1","timestamp":recent_1,
+                "message":{"role":"assistant","model":"gpt-5","usage":{"input":70,"output":30,"totalTokens":100}}}),
+            json!({"type":"thinking_level_change","effort":"low"}),
+            json!({"type":"message","id":"a2","timestamp":recent_2,
+                "message":{"role":"assistant","model":"gpt-5","usage":{"input":30,"output":20,"totalTokens":50}}}),
+        ),
+    )
+    .unwrap();
+
+    fs::write(
+        dir.path().join("beta.jsonl"),
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            json!({"type":"header","id":"beta","title":"Beta"}),
+            json!({"type":"thinking_level_change","effort":"medium"}),
+            json!({"type":"message","id":"b1","timestamp":recent_1,
+                "message":{"role":"assistant","model":"gpt-5","usage":{"input":20,"output":10,"totalTokens":30}}}),
+            json!({"type":"thinking_level_change","effort":"high"}),
+            json!({"type":"message","id":"b2","timestamp":recent_2,
+                "message":{"role":"assistant","model":"claude-sonnet","usage":{"input":50,"output":30,"totalTokens":80}}}),
+        ),
+    )
+    .unwrap();
+
+    fs::write(
+        dir.path().join("old.jsonl"),
+        format!(
+            "{}\n{}\n",
+            json!({"type":"header","id":"old","title":"Old"}),
+            json!({"type":"message","id":"o1","timestamp":old,
+                "message":{"role":"assistant","model":"old-model","usage":{"input":600,"output":399,"totalTokens":999}}}),
+        ),
+    )
+    .unwrap();
+
+    let output = assert_cmd::Command::cargo_bin("token-usage")
+        .unwrap()
+        .args(["--client", "gjc", "--gjc-home"])
+        .arg(dir.path())
+        .args(["--since", "7d", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).unwrap();
+    let gen_pos = stdout.find("\"generated_at\"").unwrap();
+    let totals_pos = stdout.find("\"totals\"").unwrap();
+    let models_pos = stdout.find("\"models\"").unwrap();
+    let sessions_pos = stdout.find("\"sessions\"").unwrap();
+    assert!(gen_pos < totals_pos && totals_pos < models_pos && models_pos < sessions_pos);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let models = json["models"].as_array().unwrap();
+    assert_eq!(models.len(), 2);
+
+    for entry in models {
+        assert!(entry.get("model").is_some());
+        assert!(entry.get("tokens").is_some());
+        assert!(entry.get("record_count").is_some());
+        assert!(entry.get("session_count").is_some());
+        assert!(entry.get("efforts").is_none());
+    }
+
+    assert_eq!(models[0]["model"], "gpt-5");
+    assert_eq!(models[0]["tokens"]["total_tokens"], 180);
+    assert_eq!(models[0]["record_count"], 3);
+    assert_eq!(models[0]["session_count"], 2);
+
+    assert_eq!(models[1]["model"], "claude-sonnet");
+    assert_eq!(models[1]["tokens"]["total_tokens"], 80);
+    assert_eq!(models[1]["record_count"], 1);
+    assert_eq!(models[1]["session_count"], 1);
+
+    let model_total_sum: u64 = models
+        .iter()
+        .map(|m| m["tokens"]["total_tokens"].as_u64().unwrap())
+        .sum();
+    assert_eq!(
+        model_total_sum,
+        json["totals"]["total_tokens"].as_u64().unwrap()
+    );
+    assert_eq!(model_total_sum, 260);
 }
