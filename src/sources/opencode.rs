@@ -56,10 +56,6 @@ fn open_readonly(path: &Path) -> Result<Connection> {
         bail!("OpenCode database connection is not read-only");
     }
     connection.pragma_update(None, "cache_size", -64000)?;
-    connection.pragma_update(None, "temp_store", "MEMORY")?;
-    if !connection.is_readonly("main")? {
-        bail!("OpenCode database connection is not read-only");
-    }
     Ok(connection)
 }
 
@@ -237,7 +233,8 @@ fn read_database(path: &Path, result: &mut ParseResult) -> Result<()> {
     let mut missing_sessions = HashSet::new();
     // -> returns the original JSON numeric text, not SQLite's signed i64/REAL
     // coercion. Every JSON operation is behind json_valid, and only scalars
-    // cross into Rust (never message.data, token objects, or parts).
+    // cross into Rust (never message.data, token objects, or parts). Keep the
+    // query flattenable so SQLite does not accumulate a table of payloads.
     let numeric_paths = [
         "$.time.created",
         "$.tokens.input",
@@ -252,11 +249,6 @@ fn read_database(path: &Path, result: &mut ParseResult) -> Result<()> {
                 json_valid(data) AS valid, \
                 CASE WHEN json_valid(data) THEN CASE WHEN json_type(data, '$.role') = 'text' THEN json_extract(data, '$.role') END END AS role \
             FROM message \
-        ), \
-        filtered AS MATERIALIZED ( \
-            SELECT id, session_id, data, valid, role \
-            FROM checked \
-            WHERE NOT valid OR role IS NOT 'user' \
         ) \
         SELECT id, session_id, valid, role, \
         CASE WHEN valid THEN CASE WHEN json_type(data, '$.providerID') = 'text' THEN json_extract(data, '$.providerID') END END, \
@@ -275,7 +267,7 @@ fn read_database(path: &Path, result: &mut ParseResult) -> Result<()> {
             (json_type(data, '$.time.completed') IN ('integer', 'real') OR \
              COALESCE(json_type(data, '$.finish') != 'null', 0) OR \
              COALESCE(json_type(data, '$.error') != 'null', 0)) ELSE 0 END \
-        FROM filtered",
+        FROM checked WHERE NOT valid OR role IS NOT 'user'",
     );
     {
         let mut statement = transaction.prepare(&sql)?;
