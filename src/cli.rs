@@ -235,6 +235,7 @@ fn session_timeline_snapshot(
     Ok(AggregateSnapshot {
         generated_at: snapshot.generated_at,
         totals: session.tokens.clone(),
+        models: Vec::new(),
         sessions: vec![session.clone()],
         dates: Vec::new(),
         timeline: timeline.into_values().collect(),

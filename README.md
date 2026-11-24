@@ -265,6 +265,7 @@ date         total       input       output      reasoning   records
 
 - `generated_at`: 집계 생성 시각
 - `totals`: 현재 필터 범위 전체의 정확한 토큰 합계
+- `models`: 현재 필터 범위의 모델별 토큰 합계 목록(effort 구분 없이 모델별 `tokens`, `record_count`, `session_count` 집계, 총 토큰 내림차순)
 - `sessions`: 세션별 집계 목록
 - `timeline`: `--group-by` 사용 시 기간 bucket 목록
 - `periods`: TUI/요약용 today, 7 days, 30 days token totals
