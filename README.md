@@ -32,8 +32,8 @@ token-usage --version
 예:
 
 ```bash
-curl -LO https://github.com/jinzer0/token-usage/releases/download/v0.5.0/token-usage-v0.5.0-aarch64-apple-darwin.tar.gz
-tar -xzf token-usage-v0.5.0-aarch64-apple-darwin.tar.gz
+curl -LO https://github.com/jinzer0/token-usage/releases/download/v0.6.0/token-usage-v0.6.0-aarch64-apple-darwin.tar.gz
+tar -xzf token-usage-v0.6.0-aarch64-apple-darwin.tar.gz
 mkdir -p ~/.local/bin
 mv token-usage ~/.local/bin/
 token-usage --version
@@ -283,26 +283,30 @@ Codex의 `session_meta`/`turn_context`/`event_msg.token_count` 원시 로그를 
 token-usage --tui
 ```
 
-두 탭으로 구분합니다. `1 Sessions`는 세션별 전체 사용량과 모델·추론 상세, `2 Dates`는 왼쪽 날짜별 합계, 가운데 선택 날짜의 세션, 오른쪽 해당 세션의 당일 상세를 표시합니다. 날짜는 모달 없이 즉시 전환됩니다.
+세 탭으로 구분합니다. `1 Sessions`는 세션별 사용량·워크스페이스 경로·기간별 요약(`today / 7d / 30d / Nd / all`)과 모델·추론 상세, `2 Dates`는 왼쪽 날짜별 합계, 가운데 선택 날짜의 세션, 오른쪽 해당 세션의 당일 상세, `3 Models`는 일별 사용량 추세 차트와 모델별 집계·상위 세션을 표시합니다. 날짜와 필터는 모달 없이 즉시 전환됩니다.
 
-Dates 탭은 최소 **110열 × 12행**을 요구합니다. 그보다 작으면 확대 안내를 표시하고 선택은 그대로 보존합니다. 정상 크기로 돌아오면 같은 날짜와 세션을 조회할 수 있습니다.
+Dates 탭은 최소 **110열 × 12행**, Models 탭은 최소 **80열 × 14행**을 요구합니다. 그보다 작으면 확대 안내를 표시하고 선택은 그대로 보존합니다. 정상 크기로 돌아오면 같은 날짜와 세션을 조회할 수 있습니다.
 
 주요 키:
 
 ```text
-1 / 2          Sessions / Dates 탭
+1 / 2 / 3      Sessions / Dates / Models 탭
 Tab/Shift-Tab   패널 이동 (←/→도 가능)
-j/k 또는 ↑/↓   현재 패널의 날짜·세션 이동
+j/k 또는 ↑/↓   현재 패널의 날짜·세션·모델 이동
+g / G          현재 패널 맨 위 / 맨 아래 이동 (Home/End, PgUp/PgDn 지원)
 [ / ]          Dates 탭에서 이전·다음 날짜
 J/K            상세 패널 스크롤
-/              세션 검색
+c              클라이언트 필터 순환 (All → Codex → GJC → OpenCode)
+f              기간 필터 순환 (All → Today → 7d → 30d)
+F / n          임의 N일 기간 필터 입력 (1~9999)
+/              세션·워크스페이스 경로 검색 (확정 후 Esc로 해제)
 v              상세 breakdown 토글
 d              선택 세션을 고정해 Dates 탭 열기
 p              날짜 탐색의 세션 고정 켜기·끄기
-s              최신순 / 토큰 사용량순 전환
+s              최신순 / 토큰 사용량순 전환 (Models 탭은 토큰/세션/이름순)
 r              새로고침
 ?              도움말
-q              종료
+q / Ctrl+C     종료 (마우스 클릭·휠 스크롤 지원)
 ```
 
 두 탭의 기본 정렬은 세션 전체의 마지막 사용 기록 최신순입니다. 시작 시각이나 파일 수정 시각을 사용하지 않으며, 시각 미상은 마지막에 둡니다. `s`의 토큰순은 Sessions에서 현재 기간 전체, Dates에서 선택 날짜의 사용량 기준입니다. 동률은 세션 ID와 클라이언트로 안정적으로 정렬합니다. 기간 필터가 있어도 최신순의 시각은 필터 전 전체 기록 기준입니다.
@@ -340,6 +344,14 @@ cargo test
 
 - `.github/workflows/ci.yml`: PR/main push에서 fmt, clippy, test 실행
 - `.github/workflows/release.yml`: `v*` tag push 시 release archive와 `SHA256SUMS` 생성
+
+### 0.6.0 변경 사항
+
+- TUI `3 Models` 탭(일별 토큰 추세 Sparkline 차트 + 모델별 집계·effort·상위 세션)과 클라이언트(`c`)·기간(`f` 프리셋, `F`/`n` 임의 N일) 즉시 필터 추가
+- Codex(`cwd`/`runtime_workspace_roots`)·GJC(`cwd`)·OpenCode(`directory`) 세션 워크스페이스 경로 추출 및 TUI 상세 표시·`/` 경로 검색·CLI/JSON 출력 지원
+- 세션 상세에 `today / 7d / 30d / Nd / all` 다기간 요약, 캐시 히트율, 레코드 수, 스크롤 인디케이터, Narrow 위치 표시 추가
+- `unicode-width` 기반 CJK 폭 계산, 검색 확정 후 `Esc` 해제, `Ctrl+C` 종료, 마우스 클릭/휠 스크롤, Dates 컴팩트 레이아웃·증감 색상 및 CLI `--tui <SESSION>` / `--group-by <...> <SESSION>` 연동
+- Codex·GJC typed `Deserialize` + 64KB 버퍼 재사용 + `std::thread::scope` 병렬 파일 파싱, OpenCode SQLite CTE 쿼리 최적화 및 3소스 병렬 스캔으로 전체 스캔 속도 대폭 향상
 
 ### 0.5.0 변경 사항
 
