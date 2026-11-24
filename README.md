@@ -32,8 +32,8 @@ token-usage --version
 예:
 
 ```bash
-curl -LO https://github.com/jinzer0/token-usage/releases/download/v0.6.0/token-usage-v0.6.0-aarch64-apple-darwin.tar.gz
-tar -xzf token-usage-v0.6.0-aarch64-apple-darwin.tar.gz
+curl -LO https://github.com/jinzer0/token-usage/releases/download/v0.6.1/token-usage-v0.6.1-aarch64-apple-darwin.tar.gz
+tar -xzf token-usage-v0.6.1-aarch64-apple-darwin.tar.gz
 mkdir -p ~/.local/bin
 mv token-usage ~/.local/bin/
 token-usage --version
@@ -345,6 +345,10 @@ cargo test
 
 - `.github/workflows/ci.yml`: PR/main push에서 fmt, clippy, test 실행
 - `.github/workflows/release.yml`: `v*` tag push 시 release archive와 `SHA256SUMS` 생성
+
+### 0.6.1 변경 사항
+
+- `--json` 출력 최상위(`totals` 바로 아래)에 현재 필터 기간 동안의 모델별 토큰 합계(`models`: `model`, `tokens`, `record_count`, `session_count`, effort 구분 없음) 필드 추가
 
 ### 0.6.0 변경 사항
 
