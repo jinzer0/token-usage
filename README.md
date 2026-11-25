@@ -32,8 +32,8 @@ token-usage --version
 예:
 
 ```bash
-curl -LO https://github.com/jinzer0/token-usage/releases/download/v0.6.1/token-usage-v0.6.1-aarch64-apple-darwin.tar.gz
-tar -xzf token-usage-v0.6.1-aarch64-apple-darwin.tar.gz
+curl -LO https://github.com/jinzer0/token-usage/releases/download/v0.6.2/token-usage-v0.6.2-aarch64-apple-darwin.tar.gz
+tar -xzf token-usage-v0.6.2-aarch64-apple-darwin.tar.gz
 mkdir -p ~/.local/bin
 mv token-usage ~/.local/bin/
 token-usage --version
