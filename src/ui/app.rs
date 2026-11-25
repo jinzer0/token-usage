@@ -746,7 +746,7 @@ impl App {
             selected_session: self.selected_session.clone(),
             sort: self.sort,
             focus: self.focus,
-            list: self.session_list_state.clone(),
+            list: self.session_list_state,
             detail_scroll: self.detail_scroll,
         };
         match self.tab {
